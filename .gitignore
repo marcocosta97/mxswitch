@@ -1,0 +1,25 @@
+# Build products
+/mxswitch
+*.o
+*.obj
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Local tooling
+*.log
+.cache/

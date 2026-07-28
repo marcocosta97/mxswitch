@@ -1,0 +1,9 @@
+# Allow the logged-in user to talk HID++ to Logitech devices via hidraw.
+#
+#   sudo cp 42-logitech-hidpp.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# TAG+="uaccess" hands access to whoever is logged in at the seat, which is
+# preferable to a group: no need to add yourself to plugdev and log out again.
+
+KERNEL=="hidraw*", ATTRS{idVendor}=="046d", MODE="0660", TAG+="uaccess"
