@@ -9,7 +9,7 @@
 SCRIPT := "C:\Path\To\mxswitch\windows\mxswitch.ps1"
 TARGET := 2
 
-Switch(channel) {
+SwitchChannel(channel) {
     global SCRIPT
     ; PowerShell script: pass -Channel. Python script: pass the bare number.
     if (StrLower(SubStr(SCRIPT, -4)) = ".ps1") {
@@ -23,16 +23,16 @@ Switch(channel) {
 }
 
 ; Ctrl+Alt+M  ->  hand the mouse over to the other machine
-^!m::Switch(TARGET)
+^!m::SwitchChannel(TARGET)
 
 ; Ctrl+Alt+Shift+M  ->  hand it over and lock this machine behind you
 ^!+m:: {
-    Switch(TARGET)
+    SwitchChannel(TARGET)
     Sleep 500                                ; let the frame go out first
     DllCall("user32\LockWorkStation")
 }
 
 ; Explicit channels, in case you ever pair a third host
-^!1::Switch(1)
-^!2::Switch(2)
-^!3::Switch(3)
+^!1::SwitchChannel(1)
+^!2::SwitchChannel(2)
+^!3::SwitchChannel(3)
