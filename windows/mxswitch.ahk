@@ -2,37 +2,48 @@
 #SingleInstance Force
 
 ; ---------------------------------------------------------------------------
-; Edit these two lines.
+; Edit this line.
 ;   SCRIPT : full path to windows\mxswitch.ps1 (preferred) or python\mxswitch.py
-;   TARGET : the Easy-Switch channel the other machine is paired on (1-3)
+;
+; The host channels come from the mxswitch config file, so the toggle hotkey
+; switches to whichever channel is not currently active:
+;     Windows  %LOCALAPPDATA%\mxswitch\config
+;     others   ~/.config/mxswitch/config      (channel_a=1, channel_b=2)
 ; ---------------------------------------------------------------------------
 SCRIPT := "C:\Path\To\mxswitch\windows\mxswitch.ps1"
-TARGET := 2
 
-SwitchChannel(channel) {
+; True if SCRIPT ends in .ps1 (PowerShell), otherwise assume Python.
+IsPowerShell() {
     global SCRIPT
-    ; PowerShell script: pass -Channel. Python script: pass the bare number.
-    if (StrLower(SubStr(SCRIPT, -4)) = ".ps1") {
-        Run(Format(
-            'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" -Channel {2}',
-            SCRIPT, channel), , "Hide")
+    return StrLower(SubStr(SCRIPT, -4)) = ".ps1"
+}
+
+; Run mxswitch with the given arguments. PowerShell gets -Name switches,
+; Python gets --name flags.
+RunMx(argName, value := "") {
+    global SCRIPT
+    if (IsPowerShell()) {
+        args := value = "" ? "-" argName : "-" argName " " value
+        Run(Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" {2}',
+            SCRIPT, args), , "Hide")
     } else {
+        args := value = "" ? "--" StrLower(argName) : "--" StrLower(argName) " " value
         ; Use pythonw.exe so no console window flashes.
-        Run(Format('pythonw.exe "{1}" {2}', SCRIPT, channel), , "Hide")
+        Run(Format('pythonw.exe "{1}" {2}', SCRIPT, args), , "Hide")
     }
 }
 
 ; Ctrl+Alt+M  ->  hand the mouse over to the other machine
-^!m::SwitchChannel(TARGET)
+^!m::RunMx("Toggle")
 
 ; Ctrl+Alt+Shift+M  ->  hand it over and lock this machine behind you
 ^!+m:: {
-    SwitchChannel(TARGET)
+    RunMx("Toggle")
     Sleep 500                                ; let the frame go out first
     DllCall("user32\LockWorkStation")
 }
 
 ; Explicit channels, in case you ever pair a third host
-^!1::SwitchChannel(1)
-^!2::SwitchChannel(2)
-^!3::SwitchChannel(3)
+^!1::RunMx("Channel", "1")
+^!2::RunMx("Channel", "2")
+^!3::RunMx("Channel", "3")
