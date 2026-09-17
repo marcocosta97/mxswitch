@@ -139,6 +139,8 @@ if sys.platform == "win32":
 
             if caps.UsagePage < 0xFF00:
                 return None                # not a vendor-defined collection
+            if caps.OutputReportByteLength == 0:
+                return None                # nothing writable here
 
             name = ctypes.create_unicode_buffer(128)
             hid_dll.HidD_GetProductString(h, name, ctypes.sizeof(name))
@@ -196,7 +198,13 @@ if sys.platform == "win32":
         def _wait(self, ov, timeout_ms):
             transferred = wintypes.DWORD()
             if kernel32.WaitForSingleObject(self.event, timeout_ms) != WAIT_OBJECT_0:
+                # Cancel and wait for the aborted IRP to complete before the
+                # caller's OVERLAPPED/buffer go out of scope, so a late
+                # completion cannot write into freed memory or signal the event
+                # for the next operation.
                 kernel32.CancelIo(self.h)
+                kernel32.GetOverlappedResult(self.h, ctypes.byref(ov),
+                                             ctypes.byref(transferred), True)
                 return None
             if not kernel32.GetOverlappedResult(self.h, ctypes.byref(ov),
                                                 ctypes.byref(transferred), False):
@@ -360,20 +368,22 @@ def main():
               file=sys.stderr)
         return 1
     dev, dev_idx, report_id, feat_idx, info = found
+    try:
+        if args.info:
+            print(f"device     : {info['product_string']}")
+            print(f"transport  : {'direct (BT/USB)' if dev_idx == 0xFF else 'receiver'}"
+                  f"  index={dev_idx:#04x}  report={report_id:#04x}")
+            print(f"ChangeHost : feature index {feat_idx:#04x}")
+            hosts = host_info(dev, dev_idx, report_id, feat_idx)
+            if hosts:
+                print(f"channels   : {hosts[0]}, currently on {hosts[1] + 1}")
+            return 0
 
-    if args.info:
-        print(f"device     : {info['product_string']}")
-        print(f"transport  : {'direct (BT/USB)' if dev_idx == 0xFF else 'receiver'}"
-              f"  index={dev_idx:#04x}  report={report_id:#04x}")
-        print(f"ChangeHost : feature index {feat_idx:#04x}")
-        hosts = host_info(dev, dev_idx, report_id, feat_idx)
-        if hosts:
-            print(f"channels   : {hosts[0]}, currently on {hosts[1] + 1}")
+        print(f"Switching to channel {args.channel} ...")
+        set_host(dev, dev_idx, report_id, feat_idx, args.channel - 1)
         return 0
-
-    print(f"Switching to channel {args.channel} ...")
-    set_host(dev, dev_idx, report_id, feat_idx, args.channel - 1)
-    return 0
+    finally:
+        dev.close()
 
 
 if __name__ == "__main__":

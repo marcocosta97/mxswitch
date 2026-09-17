@@ -89,6 +89,10 @@ public class Hid {
 
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
     static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+    // CancelIoEx, not CancelIo: the async read may have been issued on a
+    // thread-pool thread, and CancelIo only cancels the calling thread's I/O.
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool CancelIoEx(SafeFileHandle h, IntPtr overlapped);
 
     public class Iface {
         public string Path, Product;
@@ -139,6 +143,7 @@ public class Hid {
     }
 
     FileStream stream;
+    SafeFileHandle handle;
     int inLen, outLen;
     public int OutLen { get { return outLen; } }
 
@@ -149,7 +154,13 @@ public class Hid {
         inLen = iface.InLen; outLen = iface.OutLen;
         // bufferSize 1 disables FileStream's internal buffering. Device I/O must
         // reach the driver as whole reports, never coalesced or split.
-        stream = new FileStream(h, FileAccess.ReadWrite, 1, true);
+        try {
+            stream = new FileStream(h, FileAccess.ReadWrite, 1, true);
+        } catch {
+            h.Dispose();
+            throw;
+        }
+        handle = h;
     }
 
     /*
@@ -172,12 +183,18 @@ public class Hid {
     }
 
     // A synchronous read on a device with nothing to say never returns, so this
-    // races the read against a timer and abandons it on timeout.
+    // races the read against a timer and cancels it on timeout. The aborted read
+    // must be drained before returning: FileStream serialises async operations,
+    // so a still-pending read would block every later ReadAsync until it lands.
     public byte[] Read(int timeoutMs) {
         var buf = new byte[inLen];
         try {
             var task = stream.ReadAsync(buf, 0, inLen);
-            if (Task.WaitAny(new Task[] { task }, timeoutMs) != 0) return new byte[0];
+            if (Task.WaitAny(new Task[] { task }, timeoutMs) != 0) {
+                CancelIoEx(handle, IntPtr.Zero);
+                try { task.Wait(1000); } catch (Exception) { }
+                return new byte[0];
+            }
             if (task.IsFaulted || task.Result <= 0) return new byte[0];
             var outb = new byte[task.Result];
             Array.Copy(buf, outb, task.Result);
@@ -264,12 +281,18 @@ function Get-CachedDevice {
 
     try { $dev = New-Object Hid $iface } catch { return $null }
 
-    # Confirm the cached feature index still resolves to ChangeHost.
-    $r = Invoke-HidppCall $dev 0x11 $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
-    if (-not $r) { $r = Invoke-HidppCall $dev 0x10 $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250 }
+    # Confirm the cached feature index still resolves to ChangeHost. Only hand
+    # back the report ID that actually produced the reply.
+    $rid = $c.ReportId
+    $r = Invoke-HidppCall $dev $rid $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+    if (-not $r) {
+        $alt = if ($rid -eq 0x11) { 0x10 } else { 0x11 }
+        $r = Invoke-HidppCall $dev $alt $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+        if ($r) { $rid = $alt }
+    }
     if ($r -and $r[4] -eq $c.FeatureIdx -and $r[4] -ne 0) {
         Write-Verbose 'using cached device'
-        return [pscustomobject]@{ Dev = $dev; ReportId = $c.ReportId; DevIdx = $c.DevIdx
+        return [pscustomobject]@{ Dev = $dev; ReportId = $rid; DevIdx = $c.DevIdx
                                   FeatureIdx = $c.FeatureIdx; Iface = $iface }
     }
     $dev.Close()

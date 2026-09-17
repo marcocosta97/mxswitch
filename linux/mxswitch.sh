@@ -47,7 +47,8 @@ logitech_hidraws() {
             *) other+=("$node") ;;
         esac
     done
-    printf '%s\n' "${mice[@]}" "${other[@]}" "${kbds[@]}"
+    printf '%s\n' ${mice[@]+"${mice[@]}"} ${other[@]+"${other[@]}"} \
+                  ${kbds[@]+"${kbds[@]}"}
 }
 
 # hidpp_call <fd> <report_id> <dev_idx> <feature_idx> <function> [params...]

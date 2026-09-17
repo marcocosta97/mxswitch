@@ -19,13 +19,18 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOKit/hid/IOHIDManager.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+extern char **environ;
 
 #define LOGITECH_VID      0x046D
 #define SW_ID             0x0A
@@ -107,12 +112,11 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
 
     if (!out) return 1;
 
-    double remaining = timeout_s;
-    while (remaining > 0) {
+    double deadline = CFAbsoluteTimeGetCurrent() + timeout_s;
+    while (CFAbsoluteTimeGetCurrent() < deadline) {
         g_got_reply = 0;
         g_reply_len = 0;
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
-        remaining -= 0.1;
         if (!g_got_reply || g_reply_len < 5) continue;
         if (g_reply[1] != dev_idx) continue;
         if (g_reply[2] == 0xFF || g_reply[2] == 0x8F) return 0;  /* error reply */
@@ -293,6 +297,46 @@ static int own_executable_path(char *out, size_t out_sz) {
 }
 
 /*
+ * Run `/usr/bin/sqlite3 <db> <query>` without a shell, so a path embedded in
+ * the query can never be reinterpreted as shell input. Reads at most
+ * out_sz-1 bytes of stdout. Returns the bytes read, or -1 if the process could
+ * not run or exited non-zero (e.g. the DB is TCC-protected).
+ */
+static int spawn_sqlite(const char *db, const char *query,
+                        char *out, size_t out_sz) {
+    int pfd[2];
+    if (pipe(pfd) != 0) return -1;
+
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&fa, pfd[0]);
+    posix_spawn_file_actions_addclose(&fa, pfd[1]);
+
+    char *argv[] = { (char *)"/usr/bin/sqlite3", (char *)db,
+                     (char *)query, NULL };
+    pid_t pid;
+    int rc = posix_spawn(&pid, "/usr/bin/sqlite3", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(pfd[1]);
+    if (rc != 0) {
+        close(pfd[0]);
+        return -1;
+    }
+
+    ssize_t n = read(pfd[0], out, out_sz - 1);
+    if (n < 0) n = 0;
+    out[n] = '\0';
+    close(pfd[0]);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    return (int)n;
+}
+
+/*
  * Is Input Monitoring already granted to *this* binary?
  * CGPreflightListenEventAccess() is not enough on its own: a Terminal that
  * already has the grant makes it return true for any child. Prefer the TCC
@@ -306,7 +350,7 @@ static int input_monitoring_granted(void) {
     if (!own_executable_path(exe, sizeof(exe)))
         return CGPreflightListenEventAccess() ? 1 : 0;
 
-    /* Escape single quotes for the sqlite query string. */
+    /* Double single quotes for the SQL string literal. */
     char esc[PATH_MAX * 2];
     size_t j = 0;
     for (size_t i = 0; exe[i] && j + 2 < sizeof(esc); i++) {
@@ -319,33 +363,23 @@ static int input_monitoring_granted(void) {
     }
     esc[j] = '\0';
 
-    char cmd[PATH_MAX * 3];
-    snprintf(cmd, sizeof(cmd),
-             "/usr/bin/sqlite3 \"%s\" "
-             "\"SELECT auth_value FROM access WHERE "
-             "service='kTCCServiceListenEvent' AND client='%s' LIMIT 1;\" 2>/dev/null",
-             TCC_SYSTEM_DB, esc);
+    char query[PATH_MAX * 2 + 128];
+    snprintf(query, sizeof(query),
+             "SELECT auth_value FROM access WHERE "
+             "service='kTCCServiceListenEvent' AND client='%s' LIMIT 1;", esc);
 
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return CGPreflightListenEventAccess() ? 1 : -1;
-
-    char line[32] = "";
-    if (!fgets(line, sizeof(line), fp)) {
-        int status = pclose(fp);
-        if (status != 0)
-            return CGPreflightListenEventAccess() ? 1 : 0;
-        /* No row for this path — not granted (or never prompted). */
-        return 0;
-    }
-    int status = pclose(fp);
-    if (status != 0) {
+    char line[32];
+    int n = spawn_sqlite(TCC_SYSTEM_DB, query, line, sizeof(line));
+    if (n < 0) {
         /* DB unreadable (SIP / TCC protection). Fall back. */
         return CGPreflightListenEventAccess() ? 1 : 0;
     }
+    if (n == 0)
+        /* No row for this path — not granted (or never prompted). */
+        return 0;
 
     /* auth_value 2 = allowed. 0 = denied. */
-    int auth = atoi(line);
-    return auth == 2 ? 1 : 0;
+    return atoi(line) == 2 ? 1 : 0;
 }
 
 /* Open Input Monitoring settings unless this binary is already allowed. */
@@ -418,7 +452,12 @@ int main(int argc, char **argv) {
 
     printf("Switching to channel %d ...\n", channel);
     uint8_t host = (uint8_t)(channel - 1);
-    hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 1, &host, 1, NULL, 0);
+    int sent = hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 1,
+                          &host, 1, NULL, 0);
     target_release(&t);
+    if (!sent) {
+        fprintf(stderr, "Failed to send the switch command.\n");
+        return 1;
+    }
     return 0;
 }
