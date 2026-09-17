@@ -11,26 +11,69 @@ On macOS/Linux it falls back to hidapi (pip install hidapi), since there is no
 equivalent always-present C API to lean on.
 
     python mxswitch.py --info        # show channels and which one is active
+    python mxswitch.py --status      # --info plus battery
     python mxswitch.py 2             # switch to channel 2
+    python mxswitch.py --all 2       # switch every ChangeHost device
+    python mxswitch.py --toggle      # switch to the other configured channel
     python mxswitch.py --list        # dump candidate HID interfaces
 
-Exit codes: 0 ok, 1 device not found, 2 bad usage.
+Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 partial --all failure.
 """
 
 import argparse
+import json
+import os
 import sys
 import time
+from pathlib import Path
 
 LOGITECH_VID = 0x046D
 SW_ID = 0x0A                  # software id, any value 1..15
 ROOT_FEATURE = 0x00
 FEAT_CHANGE_HOST = 0x1814
+FEAT_DEVICE_FW = 0x0003       # DEVICE_FW_VERSION, for --status
+FEAT_BATTERY_UNIFIED = 0x1004  # UNIFIED_BATTERY
+FEAT_BATTERY_LEVEL = 0x1000    # BATTERY_LEVEL_STATUS
 
 SHORT, LONG = 0x10, 0x11      # HID++ report ids
 FRAME_LEN = {SHORT: 7, LONG: 20}
 
 # 0xFF for a directly-connected device (Bluetooth/USB), 1..6 via a receiver.
 DEVICE_INDICES = (0xFF, 1, 2, 3, 4, 5, 6)
+
+DEFAULT_CONFIG = {"channel_a": 1, "channel_b": 2, "device": "primary"}
+
+
+# ---------------------------------------------------------------------------
+# Frame construction and reply classification (pure, hardware-free)
+# ---------------------------------------------------------------------------
+
+def build_frame(report_id, dev_idx, feature_idx, function, params=b"", sw_id=SW_ID):
+    """Encode one HID++ request and zero-pad it to the report's frame length."""
+    if report_id not in FRAME_LEN:
+        raise ValueError(f"unknown report id {report_id:#x}")
+    frame = bytes([report_id, dev_idx, feature_idx, (function << 4) | sw_id]) + bytes(params)
+    if len(frame) > FRAME_LEN[report_id]:
+        raise ValueError(f"frame too long for report {report_id:#x}")
+    return frame.ljust(FRAME_LEN[report_id], b"\x00")
+
+
+def classify_reply(reply, dev_idx, feature_idx, sw_id=SW_ID):
+    """Match the reply-filtering rules documented in docs/protocol.md.
+
+    Returns one of: "too_short", "ignore", "error", "match".
+    """
+    if len(reply) < 5:
+        return "too_short"
+    if reply[1] != dev_idx:
+        return "ignore"
+    if reply[2] in (0xFF, 0x8F):      # HID++ 2.0 / 1.0 error reply
+        return "error"
+    if reply[2] != feature_idx:
+        return "ignore"               # unsolicited notification
+    if (reply[3] & 0x0F) != sw_id:
+        return "ignore"
+    return "match"
 
 
 def device_rank(usage_page, usage, name):
@@ -244,10 +287,14 @@ if sys.platform == "win32":
 # ---------------------------------------------------------------------------
 
 else:
-    try:
-        import hid
-    except ImportError:
-        sys.exit("On this platform mxswitch needs hidapi:  pip install hidapi")
+    def _hid():
+        # Imported lazily so the pure protocol helpers stay importable (and
+        # testable) on machines without hidapi.
+        try:
+            import hid
+        except ImportError:
+            sys.exit("On this platform mxswitch needs hidapi:  pip install hidapi")
+        return hid
 
     def enumerate_interfaces():
         # Prefer mice over keyboards when both are present. Prefer vendor-defined
@@ -255,7 +302,7 @@ else:
         # lives on the mouse collection alone.
         seen = set()
         found = []
-        for info in hid.enumerate(LOGITECH_VID, 0):
+        for info in _hid().enumerate(LOGITECH_VID, 0):
             if info["path"] in seen:
                 continue
             seen.add(info["path"])
@@ -270,7 +317,7 @@ else:
     class Device:
         def __init__(self, info):
             self.out_len = 0                 # hidapi sizes the frame itself
-            self.dev = hid.device()
+            self.dev = _hid().device()
             self.dev.open_path(info["path"])
             self.dev.set_nonblocking(0)
 
@@ -290,45 +337,71 @@ else:
 
 def request(dev, report_id, dev_idx, feature_idx, function, params=b"", timeout_ms=500):
     """Send one HID++ call and wait for its matching reply. None on timeout/error."""
-    frame = bytes([report_id, dev_idx, feature_idx, (function << 4) | SW_ID]) + params
-    dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00"))
+    dev.write(build_frame(report_id, dev_idx, feature_idx, function, params))
 
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         reply = dev.read(timeout_ms=100)
-        if len(reply) < 5 or reply[1] != dev_idx:
-            continue
-        if reply[2] in (0xFF, 0x8F):
-            return None                      # HID++ 2.0 / 1.0 error reply
-        if reply[2] != feature_idx or (reply[3] & 0x0F) != SW_ID:
-            continue                         # unsolicited notification
-        return reply
+        outcome = classify_reply(reply, dev_idx, feature_idx)
+        if outcome == "match":
+            return reply
+        if outcome == "error":
+            return None
     return None
 
 
-def find_device():
-    """Return (dev, dev_idx, report_id, changehost_feature_idx, info) or None."""
-    probe = bytes([FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0x00])
+def resolve_feature(dev, report_id, dev_idx, feature_id):
+    """Resolve a feature ID to its runtime table index, or 0 if unsupported."""
+    probe = bytes([feature_id >> 8, feature_id & 0xFF, 0x00])
+    reply = request(dev, report_id, dev_idx, ROOT_FEATURE, 0, probe, timeout_ms=300)
+    return reply[4] if reply else 0
+
+
+def iter_devices(want_all):
+    """Yield discovered ChangeHost-capable devices, mouse first.
+
+    One physical device can expose several collections that all answer the
+    probe; only the first matching collection per (product, device index) is
+    yielded, so `--all` does not switch the same device twice.
+    """
     for info in enumerate_interfaces():
         try:
             dev = Device(info)
         except OSError:
             continue
-        # A collection only carries frames it has room for.
         report_ids = [r for r in (LONG, SHORT)
                       if not info["out_len"] or FRAME_LEN[r] <= info["out_len"]]
+        matched = False
         for dev_idx in DEVICE_INDICES:
             for report_id in report_ids:
                 try:
                     reply = request(dev, report_id, dev_idx, ROOT_FEATURE, 0,
-                                    probe, timeout_ms=250)
+                                    bytes([FEAT_CHANGE_HOST >> 8,
+                                           FEAT_CHANGE_HOST & 0xFF, 0x00]),
+                                    timeout_ms=250)
                 except OSError:
                     continue
-                # reply[4] is the feature index; 0 means "not supported"
                 if reply and reply[4] != 0x00:
-                    return dev, dev_idx, report_id, reply[4], info
-        dev.close()
-    return None
+                    matched = True
+                    break
+            if matched:
+                break
+        if not matched:
+            dev.close()
+            continue
+
+        key = ((info["product_string"] or "").lower(), dev_idx)
+        if key in iter_devices.seen:
+            dev.close()
+            continue
+        iter_devices.seen.add(key)
+
+        yield dev, dev_idx, report_id, reply[4], info
+        if not want_all:
+            return
+
+
+iter_devices.seen = set()
 
 
 def host_info(dev, dev_idx, report_id, feat_idx):
@@ -336,18 +409,153 @@ def host_info(dev, dev_idx, report_id, feat_idx):
     return (reply[4], reply[5]) if reply else None
 
 
-def set_host(dev, dev_idx, report_id, feat_idx, host_0based):
+def battery_status(dev, dev_idx, report_id):
+    """(percent, charging) from whichever battery feature the device exposes."""
+    for feat_id in (FEAT_BATTERY_UNIFIED, FEAT_BATTERY_LEVEL):
+        idx = resolve_feature(dev, report_id, dev_idx, feat_id)
+        if not idx:
+            continue
+        reply = request(dev, report_id, dev_idx, idx, 0, timeout_ms=300)
+        if reply and len(reply) >= 6:
+            return reply[4], bool(reply[5] & 0x01)
+    return None
+
+
+def firmware_version(dev, dev_idx, report_id):
+    """Best-effort main firmware version from DEVICE_FW_VERSION."""
+    idx = resolve_feature(dev, report_id, dev_idx, FEAT_DEVICE_FW)
+    if not idx:
+        return None
+    reply = request(dev, report_id, dev_idx, idx, 0, timeout_ms=300)
+    if not reply or len(reply) < 8 or reply[4] == 0:
+        return None
+    major, minor = reply[6], reply[7]
+    if major == 0 and minor == 0:
+        return None
+    return f"{major}.{minor}"
+
+
+def set_host(dev, dev_idx, report_id, feat_idx, host_0based, dry_run=False):
     """setCurrentHost. Never replies - the link is gone by then."""
-    frame = bytes([report_id, dev_idx, feat_idx, (1 << 4) | SW_ID, host_0based])
-    dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00"))
+    frame = build_frame(report_id, dev_idx, feat_idx, 1, bytes([host_0based]))
+    if dry_run:
+        return frame
+    dev.write(frame)
+    return frame
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+def config_path():
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "mxswitch" / "config"
+
+
+def load_config(path=None):
+    """key=value config. Missing file or malformed lines fall back to defaults."""
+    cfg = dict(DEFAULT_CONFIG)
+    p = Path(path) if path else config_path()
+    try:
+        text = p.read_text()
+    except OSError:
+        return cfg
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = (part.strip() for part in line.split("=", 1))
+        key = key.lower()
+        if key in ("channel_a", "channel_b"):
+            try:
+                value = int(value)
+            except ValueError:
+                continue
+        if key in cfg:
+            cfg[key] = value
+    return cfg
+
+
+def validate_config(cfg):
+    problems = []
+    for key in ("channel_a", "channel_b"):
+        if cfg[key] not in (1, 2, 3):
+            problems.append(f"{key} must be 1, 2 or 3")
+    if cfg["channel_a"] == cfg["channel_b"]:
+        problems.append("channel_a and channel_b must differ")
+    if cfg["device"] not in ("primary", "all"):
+        problems.append("device must be primary or all")
+    return problems
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def describe_device(dev, dev_idx, report_id, feat_idx, info, status=False):
+    data = {
+        "product": info["product_string"],
+        "device_index": dev_idx,
+        "report_id": report_id,
+        "feature_index": feat_idx,
+        "transport": "direct (BT/USB)" if dev_idx == 0xFF else "receiver",
+    }
+    hosts = host_info(dev, dev_idx, report_id, feat_idx)
+    if hosts:
+        data["hosts"] = hosts[0]
+        data["channel"] = hosts[1] + 1
+    if status:
+        battery = battery_status(dev, dev_idx, report_id)
+        if battery:
+            data["battery_percent"], data["charging"] = battery
+        fw = firmware_version(dev, dev_idx, report_id)
+        if fw:
+            data["firmware"] = fw
+    return data
+
+
+def print_human(data):
+    print(f"device     : {data['product']}")
+    print(f"transport  : {data['transport']}  index={data['device_index']:#04x}"
+          f"  report={data['report_id']:#04x}")
+    print(f"ChangeHost : feature index {data['feature_index']:#04x}")
+    if "hosts" in data:
+        print(f"channels   : {data['hosts']}, currently on {data['channel']}")
+    if "battery_percent" in data:
+        state = "charging" if data.get("charging") else "discharging"
+        print(f"battery    : {data['battery_percent']}% ({state})")
+    if "firmware" in data:
+        print(f"firmware   : {data['firmware']}")
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"{self.prog}: error: {message}\n")
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("channel", nargs="?", type=int, help="target channel, 1-based")
+    ap = _Parser(description=__doc__,
+                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("channel", nargs="?", type=int,
+                    help=f"target channel, 1-based (default: {DEFAULT_CONFIG['channel_b']} when omitted)")
     ap.add_argument("--info", action="store_true", help="show host info and exit")
+    ap.add_argument("--status", action="store_true",
+                    help="show host info plus battery and firmware")
     ap.add_argument("--list", action="store_true", help="dump HID interfaces and exit")
+    ap.add_argument("--all", action="store_true",
+                    help="switch every ChangeHost device, not just the preferred one")
+    ap.add_argument("--toggle", action="store_true",
+                    help="switch to the other channel in the configured pair")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the frames that would be sent, without sending")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--verbose", action="store_true", help="explain what is probed")
+    ap.add_argument("--config", metavar="PATH", help="config file path")
     args = ap.parse_args()
 
     if args.list:
@@ -356,34 +564,93 @@ def main():
                   f"  out={i['out_len']}  {i['product_string']}")
         return 0
 
-    if not args.info and args.channel is None:
-        ap.error("give a channel number, or --info")
-    if args.channel is not None and not 1 <= args.channel <= 3:
-        ap.error("channel must be 1, 2 or 3")
+    cfg = load_config(args.config)
+    problems = validate_config(cfg)
 
-    found = find_device()
-    if not found:
+    modes = [args.info, args.status, args.toggle]
+    if sum(bool(m) for m in modes) > 1:
+        ap.error("--info, --status and --toggle are mutually exclusive")
+
+    want_all = args.all or cfg["device"] == "all"
+
+    if args.toggle and (problems or cfg["channel_a"] == cfg["channel_b"]):
+        sys.stderr.write("Cannot toggle: " + "; ".join(problems or
+                         ["channel_a and channel_b must differ"]) + "\n")
+        return 2
+    if not args.info and not args.status and not args.toggle:
+        if args.channel is None or not 1 <= args.channel <= 3:
+            ap.error("channel must be 1, 2 or 3")
+
+    if args.verbose:
+        print(f"config     : {config_path()}", file=sys.stderr)
+
+    iter_devices.seen.clear()
+    devices = list(iter_devices(want_all))
+    if not devices:
         print("No Logitech device supporting ChangeHost found.", file=sys.stderr)
         print("Click the mouse once to wake it, then retry. See also --list.",
               file=sys.stderr)
         return 1
-    dev, dev_idx, report_id, feat_idx, info = found
+
     try:
-        if args.info:
-            print(f"device     : {info['product_string']}")
-            print(f"transport  : {'direct (BT/USB)' if dev_idx == 0xFF else 'receiver'}"
-                  f"  index={dev_idx:#04x}  report={report_id:#04x}")
-            print(f"ChangeHost : feature index {feat_idx:#04x}")
-            hosts = host_info(dev, dev_idx, report_id, feat_idx)
-            if hosts:
-                print(f"channels   : {hosts[0]}, currently on {hosts[1] + 1}")
+        if args.info or args.status:
+            reports = [describe_device(*d, status=args.status) for d in devices]
+            if args.json:
+                print(json.dumps(reports[0] if not want_all else reports, indent=2))
+            else:
+                for i, report in enumerate(reports):
+                    if i:
+                        print()
+                    print_human(report)
+            return 0
+
+        if args.toggle:
+            primary = devices[0]
+            hosts = host_info(primary[0], primary[1], primary[2], primary[3])
+            if not hosts:
+                sys.stderr.write("Could not read the current channel.\n")
+                return 1
+            current = hosts[1] + 1
+            if current == cfg["channel_a"]:
+                args.channel = cfg["channel_b"]
+            elif current == cfg["channel_b"]:
+                args.channel = cfg["channel_a"]
+            else:
+                sys.stderr.write(
+                    f"Current channel {current} is not in the configured pair "
+                    f"{cfg['channel_a']},{cfg['channel_b']}. Refusing to guess.\n")
+                return 1
+
+        target = args.channel - 1
+        if args.dry_run:
+            for dev, dev_idx, report_id, feat_idx, info in devices:
+                frame = set_host(dev, dev_idx, report_id, feat_idx, target,
+                                 dry_run=True)
+                print(f"{info['product_string'] or 'device'}: "
+                      f"switch to channel {args.channel} -> {frame.hex()}")
             return 0
 
         print(f"Switching to channel {args.channel} ...")
-        set_host(dev, dev_idx, report_id, feat_idx, args.channel - 1)
+        failures = []
+        for dev, dev_idx, report_id, feat_idx, info in devices:
+            try:
+                set_host(dev, dev_idx, report_id, feat_idx, target)
+                name = info["product_string"] or "device"
+                print(f"  {name}: command sent")
+            except OSError as exc:
+                failures.append((info["product_string"] or "device", exc))
+        for name, exc in failures:
+            sys.stderr.write(f"  {name}: failed ({exc})\n")
+
+        if failures and len(failures) == len(devices):
+            return 1
+        if failures:
+            sys.stderr.write(f"{len(failures)} of {len(devices)} devices failed.\n")
+            return 3
         return 0
     finally:
-        dev.close()
+        for dev, *_rest in devices:
+            dev.close()
 
 
 if __name__ == "__main__":
