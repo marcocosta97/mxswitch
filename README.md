@@ -16,8 +16,8 @@ third-party dependencies**; the Python port needs `hidapi` except on Windows:
 
 Pick one. They are not layered on each other — each is a standalone file
 implementing the same protocol against its platform's native HID API. When both
-a mouse and a keyboard are present, the mouse is preferred; use Options+ / Flow
-(or `input-switcher`) to move a pair together.
+a mouse and a keyboard are present, the mouse is preferred by default; pass
+`--all` to move every ChangeHost device on the machine together.
 
 ## Why this exists
 
@@ -70,6 +70,28 @@ The practical consequence: if you switch to a channel whose host is asleep, off,
 or has Bluetooth disabled, the device parks on a dead channel and the button
 underneath is your only way back. Keep the target awake, or pair it via a
 receiver, which stays live whenever the machine is powered.
+
+## Command line
+
+```sh
+mxswitch 2          # switch to channel 2
+mxswitch --info     # device, transport, feature index, current channel
+mxswitch --all 2    # switch every ChangeHost device, not just the preferred one
+mxswitch --toggle   # switch to the other channel in the configured pair
+```
+
+PowerShell spells the long options `-Info`, `-All`, `-Toggle`. `--toggle` reads
+the current channel and moves to the other one of a pair you configure, so the
+target is not hardcoded in your hotkey. The pair lives in
+`${XDG_CONFIG_HOME:-$HOME/.config}/mxswitch/config` on macOS and Linux,
+`%LOCALAPPDATA%\mxswitch\config` on Windows:
+
+```ini
+channel_a=1
+channel_b=2
+```
+
+Exit codes are `0` success, `1` no device found and `2` bad usage.
 
 ## Install
 
@@ -146,19 +168,24 @@ On Windows the Python version drives `hid.dll` and `setupapi.dll` through
 
 ## Binding a shortcut
 
-**Windows** — `windows/mxswitch.ahk` (AutoHotkey v2). Edit the three paths at the
-top and drop a shortcut to it in `shell:startup`. It also binds a variant that
-switches *and* locks the workstation, which is the one worth using day to day.
-AHK hotkeys do not fire on the lock screen, so trigger the return switch from the
-other machine rather than expecting to wake Windows and press the key.
+**Windows** — `windows/mxswitch.ahk` (AutoHotkey v2). Set `SCRIPT` at the top and
+drop a shortcut to it in `shell:startup`. The main hotkey runs `-Toggle`, so
+your channel pair lives in the config file rather than in the script. It also
+binds a variant that switches *and* locks the workstation, which is the one worth
+using day to day. AHK hotkeys do not fire on the lock screen, so trigger the
+return switch from the other machine rather than expecting to wake Windows and
+press the key.
 
 **macOS** — BetterTouchTool: keyboard shortcut trigger → *Execute Terminal
 Command / Shell Script (async, non-blocking)* → e.g.
-`$HOME/.local/bin/mxswitch 2` or the absolute path to `./mxswitch` in this
+`$HOME/.local/bin/mxswitch --toggle` or the absolute path to `./mxswitch` in this
 repo. Raycast script commands and Automator Quick Actions work the same way.
 
 **Linux** — GNOME Settings → Keyboard → Custom Shortcuts, or the KDE equivalent,
-pointing at e.g. `$HOME/.local/bin/mxswitch 2`.
+pointing at e.g. `$HOME/.local/bin/mxswitch --toggle`.
+
+Prefer `--toggle` to a hardcoded channel: pairing a third host later does not
+silently change which channel a bare `2` means.
 
 ## Prior art
 
@@ -179,7 +206,6 @@ better, use it:
 
 What is different here: no vendored binaries anywhere, one self-contained file
 per platform, and runtime feature-index discovery rather than hardcoded offsets.
-
 
 ## License
 
