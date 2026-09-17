@@ -9,20 +9,27 @@
  *
  * Usage:
  *     ./mxswitch --info
+ *     ./mxswitch --status
  *     ./mxswitch 2
+ *     ./mxswitch --all 2
+ *     ./mxswitch --toggle
  *     ./mxswitch --setup              # open Input Monitoring settings if needed
  *
  * Needs Input Monitoring (System Settings > Privacy & Security). Grant it to
  * this binary, and to whatever launches it (BetterTouchTool, Raycast, ...).
+ *
+ * Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 partial --all failure.
  */
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOKit/hid/IOHIDManager.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <spawn.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,11 +43,18 @@ extern char **environ;
 #define SW_ID             0x0A
 #define ROOT_FEATURE      0x00
 #define FEAT_CHANGE_HOST  0x1814
+#define FEAT_DEVICE_FW    0x0003
+#define FEAT_BATTERY_UNIFIED 0x1004
+#define FEAT_BATTERY_LEVEL   0x1000
 
 #define REPORT_SHORT 0x10
 #define REPORT_LONG  0x11
+#define MAX_DEVICES  8
 
-static const uint8_t DEVICE_INDICES[] = { 0xFF, 0x01, 0x02, 0x03 };
+static const uint8_t DEVICE_INDICES[] = { 0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
+
+/* Reply classification, shared by the I/O loop and the tests. */
+enum { REPLY_TOO_SHORT, REPLY_IGNORE, REPLY_ERROR, REPLY_MATCH };
 
 /* ------------------------------------------------------------------ */
 
@@ -54,6 +68,34 @@ static int32_t prop_int(IOHIDDeviceRef dev, CFStringRef key) {
 
 static size_t frame_len(uint8_t report_id) {
     return report_id == REPORT_SHORT ? 7 : 20;
+}
+
+/* Encode one HID++ request, zero-padded to the report length. Returns the
+ * frame length, or 0 if the report id or parameter count is invalid. */
+static size_t frame_build(uint8_t report_id, uint8_t dev_idx, uint8_t feature_idx,
+                          uint8_t function, const uint8_t *params, size_t nparams,
+                          uint8_t *out) {
+    if (report_id != REPORT_SHORT && report_id != REPORT_LONG) return 0;
+    size_t len = frame_len(report_id);
+    if (nparams > len - 4) return 0;
+    memset(out, 0, len);
+    out[0] = report_id;
+    out[1] = dev_idx;
+    out[2] = feature_idx;
+    out[3] = (uint8_t)((function << 4) | SW_ID);
+    if (params && nparams) memcpy(out + 4, params, nparams);
+    return len;
+}
+
+/* Match the reply-filtering rules in docs/protocol.md. */
+static int classify_reply(const uint8_t *reply, size_t len,
+                          uint8_t dev_idx, uint8_t feature_idx) {
+    if (len < 5) return REPLY_TOO_SHORT;
+    if (reply[1] != dev_idx) return REPLY_IGNORE;
+    if (reply[2] == 0xFF || reply[2] == 0x8F) return REPLY_ERROR;
+    if (reply[2] != feature_idx) return REPLY_IGNORE;
+    if ((reply[3] & 0x0F) != SW_ID) return REPLY_IGNORE;
+    return REPLY_MATCH;
 }
 
 /* Filled in by the input report callback. */
@@ -95,14 +137,9 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
                       const uint8_t *params, size_t nparams,
                       uint8_t *out, double timeout_s) {
     uint8_t frame[20];
-    size_t len = frame_len(report_id);
-
-    memset(frame, 0, sizeof(frame));
-    frame[0] = report_id;
-    frame[1] = dev_idx;
-    frame[2] = feature_idx;
-    frame[3] = (uint8_t)((function << 4) | SW_ID);
-    if (params && nparams) memcpy(frame + 4, params, nparams > 16 ? 16 : nparams);
+    size_t len = frame_build(report_id, dev_idx, feature_idx, function,
+                             params, nparams, frame);
+    if (!len) return 0;
 
     /* Report ID goes both in the buffer and as its own argument - this is what
      * hidapi does on macOS and what Logitech devices expect. */
@@ -118,35 +155,49 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
         g_reply_len = 0;
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
         if (!g_got_reply || g_reply_len < 5) continue;
-        if (g_reply[1] != dev_idx) continue;
-        if (g_reply[2] == 0xFF || g_reply[2] == 0x8F) return 0;  /* error reply */
-        if (g_reply[2] != feature_idx) continue;                 /* notification */
-        if ((g_reply[3] & 0x0F) != SW_ID) continue;
+        int verdict = classify_reply(g_reply, (size_t)g_reply_len, dev_idx, feature_idx);
+        if (verdict == REPLY_IGNORE || verdict == REPLY_TOO_SHORT) continue;
+        if (verdict == REPLY_ERROR) return 0;
         memcpy(out, g_reply, (size_t)g_reply_len);
         return 1;
     }
     return 0;
 }
 
+/* Resolve a feature ID to its runtime table index, or 0 if unsupported. */
+static uint8_t resolve_feature(IOHIDDeviceRef dev, uint8_t report_id,
+                               uint8_t dev_idx, uint16_t feature_id) {
+    uint8_t probe[3] = { (uint8_t)(feature_id >> 8), (uint8_t)feature_id, 0 };
+    uint8_t reply[64];
+    if (!hidpp_call(dev, report_id, dev_idx, ROOT_FEATURE, 0, probe, 3, reply, 0.3))
+        return 0;
+    return reply[4];
+}
+
 /* ------------------------------------------------------------------ */
 
 typedef struct {
-    IOHIDManagerRef mgr;     /* kept alive while dev is open */
-    IOHIDDeviceRef dev;
     uint8_t dev_idx, report_id, feature_idx;
     char name[128];
-} target_t;
+} device_info_t;
 
-static void target_release(target_t *t) {
-    if (t->dev) {
-        IOHIDDeviceUnscheduleFromRunLoop(t->dev, CFRunLoopGetCurrent(),
+typedef struct {
+    IOHIDManagerRef mgr;          /* kept alive while any dev is open */
+    IOHIDDeviceRef devs[MAX_DEVICES];
+    device_info_t info[MAX_DEVICES];
+    int count;
+} device_set_t;
+
+static void devices_release(device_set_t *set) {
+    for (int i = 0; i < set->count; i++) {
+        IOHIDDeviceUnscheduleFromRunLoop(set->devs[i], CFRunLoopGetCurrent(),
                                          kCFRunLoopDefaultMode);
-        IOHIDDeviceClose(t->dev, kIOHIDOptionsTypeNone);
-        t->dev = NULL;
+        IOHIDDeviceClose(set->devs[i], kIOHIDOptionsTypeNone);
     }
-    if (t->mgr) {
-        CFRelease(t->mgr);
-        t->mgr = NULL;
+    set->count = 0;
+    if (set->mgr) {
+        CFRelease(set->mgr);
+        set->mgr = NULL;
     }
 }
 
@@ -177,20 +228,25 @@ static int cand_cmp(const void *a, const void *b) {
     return ((const cand_t *)a)->rank - ((const cand_t *)b)->rank;
 }
 
-static int find_device(target_t *t, int list_only) {
-    memset(t, 0, sizeof(*t));
+/*
+ * Discover ChangeHost-capable devices. With want_all set, every unique device
+ * (deduped by name + device index) is collected; otherwise the first ranked
+ * one. Returns the number of devices in *set.
+ */
+static int find_devices(device_set_t *set, int want_all, int verbose) {
+    memset(set, 0, sizeof(*set));
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
                                              kIOHIDOptionsTypeNone);
     if (!mgr) return 0;
     IOHIDManagerSetDeviceMatching(mgr, NULL);
 
-    CFSetRef set = IOHIDManagerCopyDevices(mgr);
-    if (!set) { CFRelease(mgr); return 0; }
+    CFSetRef cset = IOHIDManagerCopyDevices(mgr);
+    if (!cset) { CFRelease(mgr); return 0; }
 
-    CFIndex count = CFSetGetCount(set);
+    CFIndex count = CFSetGetCount(cset);
     IOHIDDeviceRef *devices = calloc((size_t)count, sizeof(IOHIDDeviceRef));
-    CFSetGetValues(set, (const void **)devices);
+    CFSetGetValues(cset, (const void **)devices);
 
     cand_t *cands = calloc((size_t)count, sizeof(cand_t));
     CFIndex ncand = 0;
@@ -209,11 +265,6 @@ static int find_device(target_t *t, int list_only) {
         if (p && CFGetTypeID(p) == CFStringGetTypeID())
             CFStringGetCString(p, name, sizeof(name), kCFStringEncodingUTF8);
 
-        if (list_only) {
-            printf("0x%04x:0x%04x  in=%d  %s\n", usage_page, usage, max_in, name);
-            continue;
-        }
-
         cands[ncand].dev = d;
         cands[ncand].usage_page = usage_page;
         cands[ncand].usage = usage;
@@ -224,20 +275,12 @@ static int find_device(target_t *t, int list_only) {
     }
 
     free(devices);
-    CFRelease(set);
-
-    if (list_only) {
-        free(cands);
-        CFRelease(mgr);
-        return 0;
-    }
+    CFRelease(cset);
 
     qsort(cands, (size_t)ncand, sizeof(cand_t), cand_cmp);
 
-    const uint8_t probe[3] = { FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0 };
-    int found = 0;
-
-    for (CFIndex i = 0; i < ncand && !found; i++) {
+    for (CFIndex i = 0; i < ncand; i++) {
+        if (!want_all && set->count > 0) break;
         IOHIDDeviceRef d = cands[i].dev;
         int32_t max_in = cands[i].max_in;
 
@@ -249,37 +292,225 @@ static int find_device(target_t *t, int list_only) {
         IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(),
                                        kCFRunLoopDefaultMode);
 
-        uint8_t reply[64];
+        const uint8_t probe[3] = { FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0 };
         const uint8_t rids[2] = { REPORT_LONG, REPORT_SHORT };
-        for (size_t a = 0; a < sizeof(DEVICE_INDICES) && !found; a++) {
-            for (size_t b = 0; b < 2 && !found; b++) {
+        uint8_t reply[64];
+        int matched = 0;
+        uint8_t m_dev_idx = 0, m_report_id = 0, m_feature_idx = 0;
+
+        for (size_t a = 0; a < sizeof(DEVICE_INDICES) && !matched; a++) {
+            for (size_t b = 0; b < 2 && !matched; b++) {
+                if (verbose)
+                    fprintf(stderr, "probing %s index=0x%02x report=0x%02x\n",
+                            cands[i].name, DEVICE_INDICES[a], rids[b]);
                 if (!hidpp_call(d, rids[b], DEVICE_INDICES[a], ROOT_FEATURE, 0,
                                 probe, 3, reply, 0.25))
                     continue;
                 if (reply[4] == 0) continue;     /* feature not supported */
-                t->mgr = mgr;
-                t->dev = d;
-                t->dev_idx = DEVICE_INDICES[a];
-                t->report_id = rids[b];
-                t->feature_idx = reply[4];
-                snprintf(t->name, sizeof(t->name), "%s", cands[i].name);
-                found = 1;
+                matched = 1;
+                m_dev_idx = DEVICE_INDICES[a];
+                m_report_id = rids[b];
+                m_feature_idx = reply[4];
             }
         }
 
-        if (!found) {
+        int duplicate = 0;
+        for (int k = 0; k < set->count && matched; k++) {
+            if (set->info[k].dev_idx == m_dev_idx &&
+                strcasecmp(set->info[k].name, cands[i].name) == 0)
+                duplicate = 1;
+        }
+
+        if (!matched || duplicate) {
             IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
                                              kCFRunLoopDefaultMode);
             IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
+            continue;
         }
+
+        int n = set->count++;
+        set->devs[n] = d;
+        set->info[n].dev_idx = m_dev_idx;
+        set->info[n].report_id = m_report_id;
+        set->info[n].feature_idx = m_feature_idx;
+        snprintf(set->info[n].name, sizeof(set->info[n].name), "%s", cands[i].name);
     }
 
     free(cands);
-    if (!found) CFRelease(mgr);
-    return found;
+    if (set->count == 0) CFRelease(mgr);
+    else set->mgr = mgr;
+    return set->count;
+}
+
+static void list_devices(void) {
+    IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
+                                             kIOHIDOptionsTypeNone);
+    if (!mgr) return;
+    IOHIDManagerSetDeviceMatching(mgr, NULL);
+    CFSetRef set = IOHIDManagerCopyDevices(mgr);
+    if (!set) { CFRelease(mgr); return; }
+    CFIndex count = CFSetGetCount(set);
+    IOHIDDeviceRef *devices = calloc((size_t)count, sizeof(IOHIDDeviceRef));
+    CFSetGetValues(set, (const void **)devices);
+    for (CFIndex i = 0; i < count; i++) {
+        IOHIDDeviceRef d = devices[i];
+        if (prop_int(d, CFSTR(kIOHIDVendorIDKey)) != LOGITECH_VID) continue;
+        int32_t up = prop_int(d, CFSTR(kIOHIDPrimaryUsagePageKey));
+        int32_t u  = prop_int(d, CFSTR(kIOHIDPrimaryUsageKey));
+        int32_t mi = prop_int(d, CFSTR(kIOHIDMaxInputReportSizeKey));
+        char name[128] = "(unnamed)";
+        CFStringRef p = IOHIDDeviceGetProperty(d, CFSTR(kIOHIDProductKey));
+        if (p && CFGetTypeID(p) == CFStringGetTypeID())
+            CFStringGetCString(p, name, sizeof(name), kCFStringEncodingUTF8);
+        printf("0x%04x:0x%04x  in=%d  %s\n", up, u, mi, name);
+    }
+    free(devices);
+    CFRelease(set);
+    CFRelease(mgr);
 }
 
 /* ------------------------------------------------------------------ */
+/* Config                                                              */
+
+typedef struct {
+    int channel_a, channel_b;     /* 0 means "not set / invalid" */
+    char device[16];
+} config_t;
+
+static const char *default_config_path(char *buf, size_t n) {
+    const char *base = getenv("XDG_CONFIG_HOME");
+    const char *home = getenv("HOME");
+    if (base && *base) snprintf(buf, n, "%s/mxswitch/config", base);
+    else if (home && *home) snprintf(buf, n, "%s/.config/mxswitch/config", home);
+    else return NULL;
+    return buf;
+}
+
+static void config_load(config_t *cfg, const char *path) {
+    cfg->channel_a = 1;
+    cfg->channel_b = 2;
+    snprintf(cfg->device, sizeof(cfg->device), "primary");
+    char def[PATH_MAX];
+    if (!path) path = default_config_path(def, sizeof(def));
+    if (!path) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *hash = strchr(line, '#');
+        if (hash) *hash = '\0';
+        /* trim */
+        char *s = line;
+        while (*s && isspace((unsigned char)*s)) s++;
+        char *end = s + strlen(s);
+        while (end > s && isspace((unsigned char)end[-1])) *--end = '\0';
+        if (!*s) continue;
+        if (strncmp(s, "channel_a", 9) == 0 && s[9] == '=') {
+            cfg->channel_a = atoi(s + 10);   /* stored raw, validated below */
+        } else if (strncmp(s, "channel_b", 9) == 0 && s[9] == '=') {
+            cfg->channel_b = atoi(s + 10);
+        } else if (strncmp(s, "device", 6) == 0 && s[6] == '=') {
+            char *v = s + 7;
+            while (*v && isspace((unsigned char)*v)) v++;
+            snprintf(cfg->device, sizeof(cfg->device), "%s", v);
+        }
+    }
+    fclose(f);
+}
+
+/* Returns the first problem, or NULL if the config is usable for --toggle. */
+static const char *config_problem(const config_t *cfg) {
+    if (cfg->channel_a < 1 || cfg->channel_a > 3 ||
+        cfg->channel_b < 1 || cfg->channel_b > 3)
+        return "channel_a and channel_b must be 1, 2 or 3";
+    if (cfg->channel_a == cfg->channel_b)
+        return "channel_a and channel_b must differ";
+    if (strcmp(cfg->device, "primary") != 0 && strcmp(cfg->device, "all") != 0)
+        return "device must be primary or all";
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Output                                                              */
+
+static void json_string(const char *s) {
+    putchar('"');
+    for (; s && *s; s++) {
+        if (*s == '"' || *s == '\\') { putchar('\\'); putchar(*s); }
+        else if (*s == '\n') fputs("\\n", stdout);
+        else putchar(*s);
+    }
+    putchar('"');
+}
+
+typedef struct {
+    int hosts, channel;           /* channel 1-based; 0 if unknown */
+    int has_battery, battery, charging;
+    char firmware[32];
+} status_t;
+
+static void gather_status(IOHIDDeviceRef dev, const device_info_t *di,
+                          int want_status, status_t *st) {
+    memset(st, 0, sizeof(*st));
+    memset(st->firmware, 0, sizeof(st->firmware));
+    uint8_t reply[64];
+    if (hidpp_call(dev, di->report_id, di->dev_idx, di->feature_idx, 0,
+                   NULL, 0, reply, 0.4)) {
+        st->hosts = reply[4];
+        st->channel = reply[5] + 1;
+    }
+    if (!want_status) return;
+
+    const uint16_t bids[2] = { FEAT_BATTERY_UNIFIED, FEAT_BATTERY_LEVEL };
+    for (int i = 0; i < 2 && !st->has_battery; i++) {
+        uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, bids[i]);
+        if (!idx) continue;
+        if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, 0,
+                        NULL, 0, reply, 0.3))
+            continue;
+        st->has_battery = 1;
+        st->battery = reply[4];
+        st->charging = reply[5] & 0x01;
+    }
+
+    uint8_t fw_idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_FW);
+    if (fw_idx &&
+        hidpp_call(dev, di->report_id, di->dev_idx, fw_idx, 0, NULL, 0, reply, 0.3) &&
+        reply[4] > 0 && (reply[6] || reply[7]))
+        snprintf(st->firmware, sizeof(st->firmware), "%d.%d", reply[6], reply[7]);
+}
+
+static void print_human(const device_info_t *di, const status_t *st) {
+    printf("device     : %s\n", di->name);
+    printf("transport  : %s  index=0x%02x  report=0x%02x\n",
+           di->dev_idx == 0xFF ? "direct (BT/USB)" : "receiver",
+           di->dev_idx, di->report_id);
+    printf("ChangeHost : feature index 0x%02x\n", di->feature_idx);
+    if (st->hosts)
+        printf("channels   : %d, currently on %d\n", st->hosts, st->channel);
+    if (st->has_battery)
+        printf("battery    : %d%% (%s)\n", st->battery,
+               st->charging ? "charging" : "discharging");
+    if (st->firmware[0]) printf("firmware   : %s\n", st->firmware);
+}
+
+static void print_json(const device_info_t *di, const status_t *st, int last) {
+    printf("{");
+    printf("\"product\":"); json_string(di->name);
+    printf(",\"transport\":\"%s\"", di->dev_idx == 0xFF ? "direct (BT/USB)" : "receiver");
+    printf(",\"device_index\":%d", di->dev_idx);
+    printf(",\"report_id\":%d", di->report_id);
+    printf(",\"feature_index\":%d", di->feature_idx);
+    if (st->hosts) printf(",\"hosts\":%d,\"channel\":%d", st->hosts, st->channel);
+    if (st->has_battery)
+        printf(",\"battery_percent\":%d,\"charging\":%s",
+               st->battery, st->charging ? "true" : "false");
+    if (st->firmware[0]) { printf(",\"firmware\":"); json_string(st->firmware); }
+    printf("}%s", last ? "" : ",");
+}
+
+/* ------------------------------------------------------------------ */
+/* Input Monitoring setup (macOS onboarding)                           */
 
 #define TCC_SYSTEM_DB "/Library/Application Support/com.apple.TCC/TCC.db"
 #define INPUT_MONITORING_SETTINGS \
@@ -298,9 +529,9 @@ static int own_executable_path(char *out, size_t out_sz) {
 
 /*
  * Run `/usr/bin/sqlite3 <db> <query>` without a shell, so a path embedded in
- * the query can never be reinterpreted as shell input. Reads at most
- * out_sz-1 bytes of stdout. Returns the bytes read, or -1 if the process could
- * not run or exited non-zero (e.g. the DB is TCC-protected).
+ * the query can never be reinterpreted as shell input. Reads at most out_sz-1
+ * bytes of stdout. Returns the bytes read, or -1 if the process could not run
+ * or exited non-zero (e.g. the DB is TCC-protected).
  */
 static int spawn_sqlite(const char *db, const char *query,
                         char *out, size_t out_sz) {
@@ -370,14 +601,12 @@ static int input_monitoring_granted(void) {
 
     char line[32];
     int n = spawn_sqlite(TCC_SYSTEM_DB, query, line, sizeof(line));
-    if (n < 0) {
+    if (n < 0)
         /* DB unreadable (SIP / TCC protection). Fall back. */
         return CGPreflightListenEventAccess() ? 1 : 0;
-    }
     if (n == 0)
         /* No row for this path — not granted (or never prompted). */
         return 0;
-
     /* auth_value 2 = allowed. 0 = denied. */
     return atoi(line) == 2 ? 1 : 0;
 }
@@ -404,60 +633,149 @@ static int setup_input_monitoring(void) {
 
 /* ------------------------------------------------------------------ */
 
+typedef struct {
+    const char *mode;             /* info status list toggle setup, or NULL */
+    int channel;                  /* 0 = unset */
+    int all, dry, json, verbose;
+    const char *config_path;
+} opts_t;
+
+static void usage(const char *prog) {
+    fprintf(stderr,
+            "usage: %s {1|2|3|--info|--status|--toggle|--list|--setup} "
+            "[--all] [--dry-run] [--json] [--verbose] [--config PATH]\n", prog);
+}
+
+#ifndef MXSWITCH_TEST
+
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s {1|2|3|--info|--list|--setup}\n", argv[0]);
+    opts_t o = { 0 };
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strcmp(a, "1") || !strcmp(a, "2") || !strcmp(a, "3")) o.channel = atoi(a);
+        else if (!strcmp(a, "--info")) o.mode = "info";
+        else if (!strcmp(a, "--status")) o.mode = "status";
+        else if (!strcmp(a, "--toggle")) o.mode = "toggle";
+        else if (!strcmp(a, "--list")) o.mode = "list";
+        else if (!strcmp(a, "--setup")) o.mode = "setup";
+        else if (!strcmp(a, "--all")) o.all = 1;
+        else if (!strcmp(a, "--dry-run")) o.dry = 1;
+        else if (!strcmp(a, "--json")) o.json = 1;
+        else if (!strcmp(a, "--verbose")) o.verbose = 1;
+        else if (!strcmp(a, "--config") && i + 1 < argc) o.config_path = argv[++i];
+        else { usage(argv[0]); return 2; }
+    }
+
+    if (o.mode && !strcmp(o.mode, "setup"))
+        return setup_input_monitoring();
+    if (o.mode && !strcmp(o.mode, "list")) { list_devices(); return 0; }
+
+    config_t cfg;
+    config_load(&cfg, o.config_path);
+    if (o.all || strcmp(cfg.device, "all") == 0) o.all = 1;
+
+    if (o.mode && !strcmp(o.mode, "toggle")) {
+        const char *problem = config_problem(&cfg);
+        if (problem) {
+            fprintf(stderr, "Cannot toggle: %s\n", problem);
+            return 2;
+        }
+    } else if (!o.mode && o.channel == 0) {
+        usage(argv[0]);
         return 2;
     }
 
-    if (strcmp(argv[1], "--setup") == 0)
-        return setup_input_monitoring();
-
-    if (strcmp(argv[1], "--list") == 0) {
-        target_t t;
-        find_device(&t, 1);
-        return 0;
+    if (o.verbose) {
+        char def[PATH_MAX];
+        const char *path = o.config_path ? o.config_path
+                                          : default_config_path(def, sizeof(def));
+        fprintf(stderr, "config     : %s\n", path ? path : "(none)");
     }
 
-    int want_info = strcmp(argv[1], "--info") == 0;
-    int channel = 0;
-    if (!want_info) {
-        channel = atoi(argv[1]);
-        if (channel < 1 || channel > 3) {
-            fprintf(stderr, "channel must be 1, 2 or 3\n");
-            return 2;
-        }
-    }
-
-    target_t t;
-    if (!find_device(&t, 0)) {
+    device_set_t set;
+    int found = find_devices(&set, o.all, o.verbose);
+    if (!found) {
         fprintf(stderr, "No Logitech device supporting ChangeHost found.\n");
         fprintf(stderr, "Click the mouse to wake it, and check Input Monitoring.\n");
         return 1;
     }
 
+    int want_info = o.mode && (!strcmp(o.mode, "info") || !strcmp(o.mode, "status"));
+    int want_status = o.mode && !strcmp(o.mode, "status");
+
     if (want_info) {
+        if (o.json) putchar('[');
+        for (int i = 0; i < set.count; i++) {
+            status_t st;
+            gather_status(set.devs[i], &set.info[i], want_status, &st);
+            if (o.json) print_json(&set.info[i], &st, i == set.count - 1);
+            else {
+                if (i) putchar('\n');
+                print_human(&set.info[i], &st);
+            }
+        }
+        if (o.json) puts("]");
+        devices_release(&set);
+        return 0;
+    }
+
+    int channel = o.channel;
+    if (o.mode && !strcmp(o.mode, "toggle")) {
         uint8_t reply[64];
-        printf("device     : %s\n", t.name);
-        printf("transport  : %s  index=0x%02x  report=0x%02x\n",
-               t.dev_idx == 0xFF ? "direct (BT/USB)" : "receiver",
-               t.dev_idx, t.report_id);
-        printf("ChangeHost : feature index 0x%02x\n", t.feature_idx);
-        if (hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 0,
-                       NULL, 0, reply, 0.4))
-            printf("channels   : %d, currently on %d\n", reply[4], reply[5] + 1);
-        target_release(&t);
+        if (!hidpp_call(set.devs[0], set.info[0].report_id, set.info[0].dev_idx,
+                        set.info[0].feature_idx, 0, NULL, 0, reply, 0.4)) {
+            fprintf(stderr, "Could not read the current channel.\n");
+            devices_release(&set);
+            return 1;
+        }
+        int current = reply[5] + 1;
+        if (current == cfg.channel_a) channel = cfg.channel_b;
+        else if (current == cfg.channel_b) channel = cfg.channel_a;
+        else {
+            fprintf(stderr, "Current channel %d is not in the configured pair "
+                            "%d,%d. Refusing to guess.\n",
+                    current, cfg.channel_a, cfg.channel_b);
+            devices_release(&set);
+            return 1;
+        }
+    }
+
+    if (channel < 1 || channel > 3) {
+        fprintf(stderr, "channel must be 1, 2 or 3\n");
+        devices_release(&set);
+        return 2;
+    }
+
+    uint8_t host = (uint8_t)(channel - 1);
+    int failures = 0;
+
+    if (o.dry) {
+        for (int i = 0; i < set.count; i++) {
+            uint8_t frame[20];
+            size_t len = frame_build(set.info[i].report_id, set.info[i].dev_idx,
+                                     set.info[i].feature_idx, 1, &host, 1, frame);
+            printf("%s: switch to channel %d -> ", set.info[i].name, channel);
+            for (size_t b = 0; b < len; b++) printf("%02x", frame[b]);
+            putchar('\n');
+        }
+        devices_release(&set);
         return 0;
     }
 
     printf("Switching to channel %d ...\n", channel);
-    uint8_t host = (uint8_t)(channel - 1);
-    int sent = hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 1,
-                          &host, 1, NULL, 0);
-    target_release(&t);
-    if (!sent) {
-        fprintf(stderr, "Failed to send the switch command.\n");
-        return 1;
+    for (int i = 0; i < set.count; i++) {
+        int sent = hidpp_call(set.devs[i], set.info[i].report_id,
+                              set.info[i].dev_idx, set.info[i].feature_idx,
+                              1, &host, 1, NULL, 0);
+        if (sent) printf("  %s: command sent\n", set.info[i].name);
+        else { fprintf(stderr, "  %s: failed\n", set.info[i].name); failures++; }
     }
-    return 0;
+
+    devices_release(&set);
+    if (!failures) return 0;
+    if (failures == found) return 1;
+    fprintf(stderr, "%d of %d devices failed.\n", failures, found);
+    return 3;
 }
+
+#endif /* MXSWITCH_TEST */
