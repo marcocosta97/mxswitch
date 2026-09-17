@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python tests
+        if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s tests -p 'test_python.py'
+
+      - name: Python tests (Windows)
+        if: runner.os == 'Windows'
+        run: python -m unittest discover -s tests -p 'test_python.py'
+
+      - name: Bash tests
+        if: runner.os != 'Windows'
+        run: bash tests/test_bash.sh
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: make
+
+      - name: C tests
+        if: runner.os == 'macOS'
+        run: |
+          cc -O2 -Wall -Wextra -Wno-unused-function -o test_c tests/test_c.c \
+             -framework IOKit -framework CoreFoundation -framework CoreGraphics
+          ./test_c
+
+      - name: PowerShell tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+          Invoke-Pester -Path tests/test_powershell.ps1
