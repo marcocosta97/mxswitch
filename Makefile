@@ -9,9 +9,12 @@ CFLAGS  ?= -O2 -Wall -Wextra
 PREFIX  ?= /usr/local
 FRAMEWORKS = -framework IOKit -framework CoreFoundation -framework CoreGraphics
 
-.PHONY: all install uninstall clean
+.PHONY: all install uninstall clean test
 
 all: mxswitch
+
+test:
+	@./tests/run.sh
 
 mxswitch: macos/mxswitch.c
 	$(CC) $(CFLAGS) -o $@ $< $(FRAMEWORKS)
