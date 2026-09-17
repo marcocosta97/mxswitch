@@ -1,0 +1,144 @@
+{
+  "_comment": "Canonical HID++ frame encodings and reply classifications shared by every implementation's test suite. Hex is the full report, report id included, zero-padded to the report length.",
+  "software_id": 10,
+  "frame_lengths": { "16": 7, "17": 20 },
+  "frames": [
+    {
+      "name": "root getFeature 0x1814, long",
+      "report_id": 17,
+      "device_index": 255,
+      "feature_index": 0,
+      "function": 0,
+      "params": [24, 20, 0],
+      "hex": "11ff000a18140000000000000000000000000000"
+    },
+    {
+      "name": "root getFeature 0x1814, short",
+      "report_id": 16,
+      "device_index": 255,
+      "feature_index": 0,
+      "function": 0,
+      "params": [24, 20, 0],
+      "hex": "10ff000a181400"
+    },
+    {
+      "name": "getHostInfo, long",
+      "report_id": 17,
+      "device_index": 255,
+      "feature_index": 10,
+      "function": 0,
+      "params": [],
+      "hex": "11ff0a0a00000000000000000000000000000000"
+    },
+    {
+      "name": "getHostInfo, short",
+      "report_id": 16,
+      "device_index": 255,
+      "feature_index": 10,
+      "function": 0,
+      "params": [],
+      "hex": "10ff0a0a000000"
+    },
+    {
+      "name": "setCurrentHost(1) channel 2, long",
+      "report_id": 17,
+      "device_index": 255,
+      "feature_index": 10,
+      "function": 1,
+      "params": [1],
+      "hex": "11ff0a1a01000000000000000000000000000000"
+    },
+    {
+      "name": "setCurrentHost(1) channel 2, short",
+      "report_id": 16,
+      "device_index": 255,
+      "feature_index": 10,
+      "function": 1,
+      "params": [1],
+      "hex": "10ff0a1a010000"
+    },
+    {
+      "name": "setCurrentHost(0) channel 1 via receiver slot 2, long",
+      "report_id": 17,
+      "device_index": 2,
+      "feature_index": 10,
+      "function": 1,
+      "params": [0],
+      "hex": "11020a1a00000000000000000000000000000000"
+    },
+    {
+      "name": "battery getBatteryLevelStatus, long",
+      "report_id": 17,
+      "device_index": 255,
+      "feature_index": 5,
+      "function": 0,
+      "params": [],
+      "hex": "11ff050a00000000000000000000000000000000"
+    }
+  ],
+  "replies": [
+    {
+      "name": "getHostInfo reply, 3 hosts, current channel 2",
+      "hex": "11ff0a0a03010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "match"
+    },
+    {
+      "name": "root getFeature reply, index 0x0A",
+      "hex": "11ff000a0a000400000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 0,
+      "outcome": "match"
+    },
+    {
+      "name": "battery reply, 88% and charging",
+      "hex": "11ff050a58010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 5,
+      "outcome": "match"
+    },
+    {
+      "name": "unsolicited notification for another feature",
+      "hex": "11ff050a00000000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "ignore"
+    },
+    {
+      "name": "reply from another device index",
+      "hex": "11010a0a03010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "ignore"
+    },
+    {
+      "name": "reply with a different software id",
+      "hex": "11ff0a1b03010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "ignore"
+    },
+    {
+      "name": "HID++ 2.0 error reply",
+      "hex": "11ffff0a00000000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "error"
+    },
+    {
+      "name": "HID++ 1.0 error reply",
+      "hex": "11ff8f0a00000000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "error"
+    },
+    {
+      "name": "reply shorter than a HID++ header",
+      "hex": "11ff0a",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "too_short"
+    }
+  ]
+}
