@@ -27,7 +27,15 @@ RunMx(argName, value := "") {
         Run(Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" {2}',
             SCRIPT, args), , "Hide")
     } else {
-        args := value = "" ? "--" StrLower(argName) : "--" StrLower(argName) " " value
+        ; Python takes the channel as a positional argument; the rest are flags
+        ; (--toggle, ...). Passing --channel is not accepted by mxswitch.py.
+        if (argName = "Channel") {
+            args := value
+        } else if (value = "") {
+            args := "--" StrLower(argName)
+        } else {
+            args := "--" StrLower(argName) " " value
+        }
         ; Use pythonw.exe so no console window flashes.
         Run(Format('pythonw.exe "{1}" {2}', SCRIPT, args), , "Hide")
     }

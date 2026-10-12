@@ -211,6 +211,7 @@ public class Hid {
         HidD_GetHidGuid(ref guid);
         IntPtr set = SetupDiGetClassDevsW(ref guid, IntPtr.Zero, IntPtr.Zero,
                                           DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (set == new IntPtr(-1)) return result;   // INVALID_HANDLE_VALUE
         try {
             var did = new SP_DEVICE_INTERFACE_DATA();
             did.cbSize = Marshal.SizeOf(did);
@@ -293,6 +294,7 @@ public class Hid {
     // must be drained before returning: FileStream serialises async operations,
     // so a still-pending read would block every later ReadAsync until it lands.
     public byte[] Read(int timeoutMs) {
+        if (inLen <= 0) return new byte[0];
         var buf = new byte[inLen];
         try {
             var task = stream.ReadAsync(buf, 0, inLen);
@@ -372,7 +374,10 @@ function Get-CachedDevices {
         $iface.UsagePage = $c.UsagePage; $iface.Usage = $c.Usage; $iface.Pid = $c.Pid
         $iface.InLen = $c.InLen; $iface.OutLen = $c.OutLen
 
-        try { $dev = New-Object Hid $iface } catch { return @() }
+        try { $dev = New-Object Hid $iface } catch {
+            foreach ($v in $valid) { $v.Dev.Close() }
+            return @()
+        }
 
         # Confirm the cached feature index still resolves to ChangeHost. Only
         # accept the report ID that actually produced the reply.
@@ -388,6 +393,7 @@ function Get-CachedDevices {
                                          FeatureIdx = $c.FeatureIdx; Iface = $iface }
         } else {
             $dev.Close()
+            foreach ($v in $valid) { $v.Dev.Close() }
             return @()          # one stale entry invalidates the cache
         }
     }
@@ -418,9 +424,19 @@ function Find-MxDevices {
 
     $cached = @(Get-CachedDevices)
     if ($cached.Count -gt 0) {
-        Write-Verbose 'using cached device(s)'
-        if ($All) { return $cached }
-        return @($cached[0])
+        # A cache written by a non-All run may hold only the primary device, so
+        # never satisfy -All from it. Rescan to find every device.
+        if ($All) {
+            foreach ($c in $cached) { $c.Dev.Close() }
+        } elseif ((Get-DeviceRank $cached[0].Iface.UsagePage `
+                    $cached[0].Iface.Usage $cached[0].Iface.Product) -lt 20) {
+            # Prefer a live mouse over a cached keyboard.
+            Write-Verbose 'using cached device'
+            for ($i = 1; $i -lt $cached.Count; $i++) { $cached[$i].Dev.Close() }
+            return @($cached[0])
+        } else {
+            foreach ($c in $cached) { $c.Dev.Close() }
+        }
     }
 
     $ifaces = [Hid]::Enumerate($VID) |
