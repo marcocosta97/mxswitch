@@ -22,6 +22,13 @@ import sys
 import time
 
 LOGITECH_VID = 0x046D
+POP_ICON_KEYS_BT_PID = 0xB38F
+
+
+def product_name(name, product_id):
+    """Windows Bluetooth may omit the HID product string for POP Icon Keys."""
+    return name or ("POP Icon Keys" if product_id == POP_ICON_KEYS_BT_PID else "")
+
 SW_ID = 0x0A                  # software id, any value 1..15
 ROOT_FEATURE = 0x00
 FEAT_CHANGE_HOST = 0x1814
@@ -142,8 +149,11 @@ if sys.platform == "win32":
 
             name = ctypes.create_unicode_buffer(128)
             hid_dll.HidD_GetProductString(h, name, ctypes.sizeof(name))
+            if attrs.ProductID == POP_ICON_KEYS_BT_PID and caps.OutputReportByteLength == 0:
+                return None  # This keyboard also exposes a non-output control collection.
             return {"path": path, "usage_page": caps.UsagePage, "usage": caps.Usage,
-                    "product_id": attrs.ProductID, "product_string": name.value,
+                    "product_id": attrs.ProductID,
+                    "product_string": product_name(name.value, attrs.ProductID),
                     "in_len": caps.InputReportByteLength,
                     "out_len": caps.OutputReportByteLength}
         finally:
