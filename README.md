@@ -77,8 +77,14 @@ receiver, which stays live whenever the machine is powered.
 mxswitch 2          # switch to channel 2
 mxswitch --info     # device, transport, feature index, current channel
 mxswitch --all 2    # switch every ChangeHost device, not just the preferred one
+mxswitch --name Keys  # only devices whose product name contains "Keys"
 mxswitch --toggle   # switch to the other channel in the configured pair
 ```
+
+`--name` (repeatable) keeps only devices whose product name contains one of the
+given substrings; with `--all` it moves exactly the matched devices, e.g. a
+keyboard and mouse while leaving a third device alone. The config `name=` list
+is combined with it.
 
 PowerShell spells the long options `-Info`, `-All`, `-Toggle`. `--toggle` reads
 the current channel and moves to the other one of a pair you configure, so the

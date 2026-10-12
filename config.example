@@ -1,0 +1,25 @@
+# mxswitch configuration - optional, key=value lines.
+#
+# Copy this file to:
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/mxswitch/config   macOS, Linux
+#   %LOCALAPPDATA%\mxswitch\config                      Windows
+#
+# Command-line flags win over the file. Everything here has a default, so an
+# empty or missing file behaves the same as the values shown below.
+
+# The two channels --toggle flips between. Each must be 1, 2 or 3, and they
+# must differ. --toggle refuses to act from a third channel rather than guess.
+channel_a=1
+channel_b=2
+
+# Which ChangeHost devices to act on:
+#   primary  the single preferred device (mouse preferred over keyboard)
+#   all      every ChangeHost device found; same as passing --all
+device=primary
+
+# Restrict to devices whose product name contains one of these substrings
+# (comma-separated, case-insensitive). Combined with `device=all` this moves
+# exactly the matched devices, e.g. a mouse and keyboard while leaving a third
+# device alone. The command-line --name adds to this list.
+#   name=MX Master,MX Keys
+name=
