@@ -12,12 +12,12 @@ BeforeAll {
     $originalLocalAppData = $env:LOCALAPPDATA
     $env:MXSWITCH_TEST = '1'
     $env:LOCALAPPDATA = $TestDrive
-    . (Join-Path $PSScriptRoot '..' 'windows' 'mxswitch.ps1')
-    $source = Get-Content (Join-Path $PSScriptRoot '..' 'windows' 'mxswitch.ps1') -Raw
+    . (Join-Path $PSScriptRoot '../windows/mxswitch.ps1')
+    $source = Get-Content (Join-Path $PSScriptRoot '../windows/mxswitch.ps1') -Raw
     $native = [regex]::Match($source, "(?s)Add-Type -TypeDefinition @'\r?\n(.*?)\r?\n'@")
     if (-not $native.Success) { throw 'Native HID helper source not found' }
     Add-Type -TypeDefinition $native.Groups[1].Value
-    $fixtures = Get-Content (Join-Path $PSScriptRoot 'fixtures' 'frames.json') -Raw | ConvertFrom-Json
+    $fixtures = Get-Content (Join-Path $PSScriptRoot 'fixtures/frames.json') -Raw | ConvertFrom-Json
     function New-TestInterface {
         param([string]$Path, [hashtable]$Slots, [string]$Product = 'USB Receiver')
         [pscustomobject]@{ Path=$Path; Slots=$Slots; Product=$Product; Pid=1; UsagePage=0xff00; Usage=1; InLen=20; OutLen=20 }
