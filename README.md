@@ -181,6 +181,21 @@ What is different here: no vendored binaries anywhere, one self-contained file
 per platform, and runtime feature-index discovery rather than hardcoded offsets.
 
 
+## Switch a mouse and keyboard together
+
+The Python implementation (including Windows) and native macOS implementation accept `--both` to switch a mouse and a keyboard to the same already-paired Easy-Switch channel:
+
+```sh
+python python/mxswitch.py 2 --both
+./mxswitch 2 --both
+```
+
+Pair both devices to matching channel numbers on each computer first. The existing behavior without `--both` is preserved. Python switches the mouse first so keyboard discovery cannot delay it; macOS discovers both and switches the keyboard before the mouse. A missing/unsupported keyboard produces a nonzero exit status, even if the mouse switched successfully; the operation is not atomic and cannot roll back a device that has disconnected.
+
+POP Icon Keys over Bluetooth is recognized on Windows by product ID `0xB38F` when its HID product string is empty. Its collection without output reports is ignored. Other named Logitech keyboards exposing ChangeHost can also be selected; support must be verified on the actual device. For an unnamed keyboard with a different ID, Python accepts `--keyboard-pid HEXID` together with `--both`.
+
+The native PowerShell and Linux shell implementations do not implement this option. This change is limited to device channel switching.
+
 ## License
 
 MIT. See `LICENSE`.

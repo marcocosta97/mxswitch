@@ -55,11 +55,13 @@ static size_t frame_len(uint8_t report_id) {
 static uint8_t  g_reply[64];
 static CFIndex  g_reply_len;
 static int      g_got_reply;
+static IOHIDDeviceRef g_expected_device;
 
 static void input_cb(void *ctx, IOReturn result, void *sender,
                      IOHIDReportType type, uint32_t report_id,
                      uint8_t *report, CFIndex len) {
-    (void)ctx; (void)result; (void)sender; (void)type;
+    (void)sender; (void)type;
+    if (ctx != g_expected_device || result != kIOReturnSuccess) return;
 
     if (len <= 0 || len > (CFIndex)sizeof(g_reply) - 1) goto done;
 
@@ -101,23 +103,25 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
 
     /* Report ID goes both in the buffer and as its own argument - this is what
      * hidapi does on macOS and what Logitech devices expect. */
+    g_expected_device = dev;
+    g_got_reply = 0;
+    g_reply_len = 0;
     if (IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, report_id,
                              frame, len) != kIOReturnSuccess)
         return 0;
 
     if (!out) return 1;
 
-    double remaining = timeout_s;
-    while (remaining > 0) {
+    double deadline = CFAbsoluteTimeGetCurrent() + timeout_s;
+    while (CFAbsoluteTimeGetCurrent() < deadline) {
         g_got_reply = 0;
         g_reply_len = 0;
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
-        remaining -= 0.1;
         if (!g_got_reply || g_reply_len < 5) continue;
         if (g_reply[1] != dev_idx) continue;
         if (g_reply[2] == 0xFF || g_reply[2] == 0x8F) return 0;  /* error reply */
         if (g_reply[2] != feature_idx) continue;                 /* notification */
-        if ((g_reply[3] & 0x0F) != SW_ID) continue;
+        if (g_reply[3] != (uint8_t)((function << 4) | SW_ID)) continue;
         memcpy(out, g_reply, (size_t)g_reply_len);
         return 1;
     }
@@ -131,6 +135,7 @@ typedef struct {
     IOHIDDeviceRef dev;
     uint8_t dev_idx, report_id, feature_idx;
     char name[128];
+    uint8_t *rxbuf;
 } target_t;
 
 static void target_release(target_t *t) {
@@ -140,6 +145,8 @@ static void target_release(target_t *t) {
         IOHIDDeviceClose(t->dev, kIOHIDOptionsTypeNone);
         t->dev = NULL;
     }
+    free(t->rxbuf);
+    t->rxbuf = NULL;
     if (t->mgr) {
         CFRelease(t->mgr);
         t->mgr = NULL;
@@ -173,7 +180,7 @@ static int cand_cmp(const void *a, const void *b) {
     return ((const cand_t *)a)->rank - ((const cand_t *)b)->rank;
 }
 
-static int find_device(target_t *t, int list_only) {
+static int find_device(target_t *t, int list_only, int kind) {
     memset(t, 0, sizeof(*t));
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
@@ -210,6 +217,9 @@ static int find_device(target_t *t, int list_only) {
             continue;
         }
 
+        int rank = device_rank(usage_page, usage, name);
+        if (kind == 1 && rank < 20) continue;
+        if (kind == 0 && rank >= 20) continue;
         cands[ncand].dev = d;
         cands[ncand].usage_page = usage_page;
         cands[ncand].usage = usage;
@@ -237,11 +247,16 @@ static int find_device(target_t *t, int list_only) {
         IOHIDDeviceRef d = cands[i].dev;
         int32_t max_in = cands[i].max_in;
 
-        if (IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) != kIOReturnSuccess)
+        IOReturn open_status = IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone);
+        if (open_status != kIOReturnSuccess) {
+            if (kind == 1) fprintf(stderr, "Keyboard %s: HID open failed (0x%08x). Check Input Monitoring.\n", cands[i].name, open_status);
             continue;
+        }
+        if (kind == 1) fprintf(stderr, "Keyboard %s: HID open OK; probing ChangeHost 0x1814.\n", cands[i].name);
 
-        static uint8_t rxbuf[64];
-        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, max_in, input_cb, NULL);
+        uint8_t *rxbuf = calloc(64, 1);
+        if (!rxbuf) { IOHIDDeviceClose(d, kIOHIDOptionsTypeNone); continue; }
+        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, max_in, input_cb, d);
         IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(),
                                        kCFRunLoopDefaultMode);
 
@@ -254,6 +269,7 @@ static int find_device(target_t *t, int list_only) {
                     continue;
                 if (reply[4] == 0) continue;     /* feature not supported */
                 t->mgr = mgr;
+                t->rxbuf = rxbuf;
                 t->dev = d;
                 t->dev_idx = DEVICE_INDICES[a];
                 t->report_id = rids[b];
@@ -264,9 +280,11 @@ static int find_device(target_t *t, int list_only) {
         }
 
         if (!found) {
+            if (kind == 1) fprintf(stderr, "Keyboard %s: no usable ChangeHost reply. This does not distinguish a missing feature from blocked HID reports.\n", cands[i].name);
             IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
                                              kCFRunLoopDefaultMode);
             IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
+            free(rxbuf);
         }
     }
 
@@ -371,8 +389,8 @@ static int setup_input_monitoring(void) {
 /* ------------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s {1|2|3|--info|--list|--setup}\n", argv[0]);
+    if (argc != 2 && !(argc == 3 && strcmp(argv[2], "--both") == 0)) {
+        fprintf(stderr, "usage: %s {1|2|3|--info|--list|--setup} [--both]\n", argv[0]);
         return 2;
     }
 
@@ -381,7 +399,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "--list") == 0) {
         target_t t;
-        find_device(&t, 1);
+        find_device(&t, 1, -1);
         return 0;
     }
 
@@ -396,7 +414,7 @@ int main(int argc, char **argv) {
     }
 
     target_t t;
-    if (!find_device(&t, 0)) {
+    if (!find_device(&t, 0, argc == 3 ? 0 : -1)) {
         fprintf(stderr, "No Logitech device supporting ChangeHost found.\n");
         fprintf(stderr, "Click the mouse to wake it, and check Input Monitoring.\n");
         return 1;
@@ -416,9 +434,33 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    int keyboard_sent = argc != 3;
+    if (argc == 3) {
+        target_t keyboard;
+        if (find_device(&keyboard, 0, 1)) {
+            uint8_t status[64];
+            if (!hidpp_call(keyboard.dev, keyboard.report_id, keyboard.dev_idx,
+                            keyboard.feature_idx, 0, NULL, 0, status, 0.4)
+                || status[4] < channel) {
+                fprintf(stderr, "Keyboard target channel could not be checked; aborting.\n");
+                target_release(&keyboard);
+                target_release(&t);
+                return 1;
+            }
+            uint8_t host = (uint8_t)(channel - 1);
+            if (hidpp_call(keyboard.dev, keyboard.report_id, keyboard.dev_idx,
+                          keyboard.feature_idx, 1, &host, 1, NULL, 0))
+                { keyboard_sent = 1; printf("Switch command sent to keyboard (device confirmation unavailable).\n"); }
+            else
+                fprintf(stderr, "keyboard switch report could not be sent.\n");
+            target_release(&keyboard);
+        } else {
+            fprintf(stderr, "keyboard not found or ChangeHost unsupported; mouse only.\n");
+        }
+    }
     printf("Switching to channel %d ...\n", channel);
     uint8_t host = (uint8_t)(channel - 1);
-    hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 1, &host, 1, NULL, 0);
+    int sent = hidpp_call(t.dev, t.report_id, t.dev_idx, t.feature_idx, 1, &host, 1, NULL, 0);
     target_release(&t);
-    return 0;
+    return sent && keyboard_sent ? 0 : 1;
 }

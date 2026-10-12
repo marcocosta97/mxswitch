@@ -308,10 +308,17 @@ def request(dev, report_id, dev_idx, feature_idx, function, params=b"", timeout_
     return None
 
 
-def find_device():
+def find_device(kind=None, product_id=None):
     """Return (dev, dev_idx, report_id, changehost_feature_idx, info) or None."""
     probe = bytes([FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0x00])
     for info in enumerate_interfaces():
+        if product_id is not None and info['product_id'] != product_id:
+            continue
+        rank = device_rank(info['usage_page'], info['usage'], info['product_string'])
+        if kind == 'keyboard' and product_id is None and rank < 20:
+            continue
+        if kind == 'mouse' and rank >= 20:
+            continue
         try:
             dev = Device(info)
         except OSError:
@@ -344,12 +351,45 @@ def set_host(dev, dev_idx, report_id, feat_idx, host_0based):
     dev.write(frame.ljust(FRAME_LEN[report_id], b"\x00"))
 
 
+def switch_pair(channel, keyboard_pid=None):
+    mouse = find_device(kind='mouse')
+    if not mouse:
+        print('No mouse supporting ChangeHost found.', file=sys.stderr)
+        return 1
+    try:
+        dev, idx, report, feature, info = mouse
+        set_host(dev, idx, report, feature, channel - 1)
+        print('Switch command sent to mouse.')
+    finally:
+        mouse[0].close()
+    keyboard = find_device(kind='keyboard', product_id=keyboard_pid)
+    if not keyboard:
+        print('Mouse switched; no keyboard supporting ChangeHost found.', file=sys.stderr)
+        return 1
+    try:
+        dev, idx, report, feature, info = keyboard
+        if info['path'] == mouse[4]['path']:
+            print('Mouse and keyboard resolved to the same interface.', file=sys.stderr)
+            return 1
+        hosts = host_info(dev, idx, report, feature)
+        if not hosts or channel > hosts[0]:
+            print('Mouse switched; keyboard target channel could not be checked.', file=sys.stderr)
+            return 1
+        set_host(dev, idx, report, feature, channel - 1)
+        print('Switch command sent to keyboard.')
+        return 0
+    finally:
+        keyboard[0].close()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("channel", nargs="?", type=int, help="target channel, 1-based")
     ap.add_argument("--info", action="store_true", help="show host info and exit")
     ap.add_argument("--list", action="store_true", help="dump HID interfaces and exit")
+    ap.add_argument('--both', action='store_true', help='switch mouse and keyboard to the same channel')
+    ap.add_argument('--keyboard-pid', type=lambda value: int(value, 16), help='keyboard product ID in hex (with --both)')
     args = ap.parse_args()
 
     if args.list:
@@ -363,6 +403,12 @@ def main():
     if args.channel is not None and not 1 <= args.channel <= 3:
         ap.error("channel must be 1, 2 or 3")
 
+    if args.both:
+        if args.info or args.channel is None:
+            ap.error('--both requires a target channel')
+        return switch_pair(args.channel, args.keyboard_pid)
+    if args.keyboard_pid is not None:
+        ap.error('--keyboard-pid requires --both')
     found = find_device()
     if not found:
         print("No Logitech device supporting ChangeHost found.", file=sys.stderr)
