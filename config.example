@@ -4,8 +4,9 @@
 #   ${XDG_CONFIG_HOME:-$HOME/.config}/mxswitch/config   macOS, Linux
 #   %LOCALAPPDATA%\mxswitch\config                      Windows
 #
-# Command-line flags win over the file. Everything here has a default, so an
-# empty or missing file behaves the same as the values shown below.
+# --all selects all devices; --name adds to the name filters below.
+# An empty or missing default file uses the values shown below. Invalid
+# values are reported as errors; an explicit --config path must exist.
 
 # The two channels --toggle flips between. Each must be 1, 2 or 3, and they
 # must differ. --toggle refuses to act from a third channel rather than guess.

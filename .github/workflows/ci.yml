@@ -39,7 +39,8 @@ jobs:
       - name: C tests
         if: runner.os == 'macOS'
         run: |
-          cc -O2 -Wall -Wextra -Wno-unused-function -o test_c tests/test_c.c \
+          python3 tests/fixture_cases.py c > "$RUNNER_TEMP/frames.h"
+          cc -include "$RUNNER_TEMP/frames.h" -O2 -Wall -Wextra -Wno-unused-function -o test_c tests/test_c.c \
              -framework IOKit -framework CoreFoundation -framework CoreGraphics
           ./test_c
 
@@ -48,5 +49,13 @@ jobs:
         shell: pwsh
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
+          Invoke-Pester -Path tests/test_powershell.ps1 -CI
+
+      - name: PowerShell 5.1 tests
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -RequiredVersion 5.7.1 -Force -Scope CurrentUser -SkipPublisherCheck
           Invoke-Pester -Path tests/test_powershell.ps1 -CI

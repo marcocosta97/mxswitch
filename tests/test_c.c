@@ -4,21 +4,20 @@
  * The implementation is compiled into this translation unit with MXSWITCH_TEST
  * set, so main() there is skipped and the static frame helpers are reachable.
  *
- *   cc -O2 -Wall -o /tmp/test_c tests/test_c.c \
- *       -framework IOKit -framework CoreFoundation -framework CoreGraphics
- *   /tmp/test_c
+ * Run with ./tests/run.sh, which generates the shared fixture header.
  */
 
 #ifndef MXSWITCH_TEST
 #define MXSWITCH_TEST
 #endif
 
+#include "fake_iokit.h"
 #include "../macos/mxswitch.c"
 
 static int fails;
 
 static void hex_of(const uint8_t *b, size_t n, char *out) {
-    for (size_t i = 0; i < n; i++) sprintf(out + i * 2, "%02x", b[i]);
+    for (size_t i = 0; i < n; i++) snprintf(out + i * 2, 3, "%02x", b[i]);
     out[n * 2] = '\0';
 }
 
@@ -39,7 +38,7 @@ static void check_frame(const char *name, uint8_t report_id, uint8_t dev_idx,
 }
 
 static void check_reply(const char *name, const char *hex,
-                        uint8_t dev_idx, uint8_t feature_idx, int expected) {
+                        uint8_t dev_idx, uint8_t feature_idx, uint8_t function, int expected) {
     uint8_t reply[64];
     size_t n = strlen(hex) / 2;
     for (size_t i = 0; i < n; i++) {
@@ -47,7 +46,7 @@ static void check_reply(const char *name, const char *hex,
         sscanf(hex + i * 2, "%2x", &v);
         reply[i] = (uint8_t)v;
     }
-    int got = classify_reply(reply, n, dev_idx, feature_idx);
+    int got = classify_reply(reply, n, dev_idx, feature_idx, function, SW_ID);
     if (got != expected) {
         printf("FAIL: %s (got %d, expected %d)\n", name, got, expected);
         fails++;
@@ -109,27 +108,62 @@ static void check_name(void) {
     }
 }
 
+static void fake_init(fake_hid_t *d, const char *product) {
+    memset(d, 0, sizeof(*d));
+    d->properties = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    const char *keys[] = { kIOHIDVendorIDKey, kIOHIDPrimaryUsagePageKey, kIOHIDPrimaryUsageKey, kIOHIDMaxInputReportSizeKey };
+    int values[] = { 0x046d, 0xff00, 1, 20 };
+    for (int i = 0; i < 4; i++) {
+        CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+        CFNumberRef value = CFNumberCreate(NULL, kCFNumberIntType, &values[i]);
+        CFDictionarySetValue(d->properties, key, value); CFRelease(key); CFRelease(value);
+    }
+    CFStringRef name = CFStringCreateWithCString(NULL, product, kCFStringEncodingUTF8);
+    CFDictionarySetValue(d->properties, CFSTR(kIOHIDProductKey), name); CFRelease(name);
+    CFSetAddValue(fake_devices, d);
+}
+
+static void check_discovery(void) {
+    fake_hid_t receiver, collection, mouse;
+    fake_devices = CFSetCreateMutable(NULL, 0, NULL);
+    fake_init(&receiver, "USB Receiver"); fake_init(&collection, "USB Receiver");
+    fake_init(&mouse, "MX Master 3S");
+    receiver.names[1] = collection.names[1] = "Logitech MX Keys S Keyboard";
+    receiver.names[2] = collection.names[2] = "MX Master 3S";
+    receiver.units[1] = collection.units[1] = 1;
+    receiver.units[2] = collection.units[2] = 2;
+    mouse.names[0] = "MX Master 3S"; mouse.units[0] = 3;
+    device_set_t set;
+    if (find_devices(&set, 1, 0, NULL, 0) != 3 || set.info[0].rank >= 20) {
+        printf("FAIL: discovery did not retain all physical devices/mouse preference\n"); fails++;
+    }
+    status_t st;
+    gather_status(set.devs[0], &set.info[0], 1, &st);
+    if (st.battery != 88 || !st.charging || strcmp(st.firmware, "12.34.BABCD")) {
+        printf("FAIL: status did not read battery/main firmware protocol\n"); fails++;
+    }
+    devices_release(&set);
+    if (receiver.close_count != 1 || collection.close_count != 1 || mouse.close_count != 1) {
+        printf("FAIL: shared handles were not closed exactly once\n"); fails++;
+    }
+    const char *filters[] = { "Keys" };
+    if (find_devices(&set, 1, 0, filters, 1) != 1 || strcmp(set.info[0].name, receiver.names[1])) {
+        printf("FAIL: peripheral name filter/fragment lookup\n"); fails++;
+    }
+    devices_release(&set);
+    if (find_devices(&set, 0, 0, NULL, 0) != 1 || set.info[0].rank >= 20) {
+        printf("FAIL: primary selection\n"); fails++;
+    }
+    devices_release(&set);
+    CFRelease(receiver.properties); CFRelease(collection.properties); CFRelease(mouse.properties);
+    CFRelease(fake_devices);
+}
+
 int main(void) {
-    const uint8_t feature[3] = { 0x18, 0x14, 0x00 };
-    const uint8_t empty[1] = { 0 };
-    const uint8_t one[1] = { 1 };
-    const uint8_t zero[1] = { 0 };
-
-    check_frame("root getFeature long", REPORT_LONG, 0xFF, 0, 0,
-                feature, 3, "11ff000a18140000000000000000000000000000");
-    check_frame("root getFeature short", REPORT_SHORT, 0xFF, 0, 0,
-                feature, 3, "10ff000a181400");
-    check_frame("getHostInfo long", REPORT_LONG, 0xFF, 0x0A, 0,
-                empty, 0, "11ff0a0a00000000000000000000000000000000");
-    check_frame("getHostInfo short", REPORT_SHORT, 0xFF, 0x0A, 0,
-                empty, 0, "10ff0a0a000000");
-    check_frame("setCurrentHost(1) long", REPORT_LONG, 0xFF, 0x0A, 1,
-                one, 1, "11ff0a1a01000000000000000000000000000000");
-    check_frame("setCurrentHost(1) short", REPORT_SHORT, 0xFF, 0x0A, 1,
-                one, 1, "10ff0a1a010000");
-    check_frame("receiver slot 2", REPORT_LONG, 2, 0x0A, 1,
-                zero, 1, "11020a1a00000000000000000000000000000000");
-
+    for (size_t i = 0; i < sizeof(fixture_frames)/sizeof(fixture_frames[0]); i++) {
+        const struct fixture_frame *f = &fixture_frames[i];
+        check_frame(f->name, f->rid, f->didx, f->fidx, f->function, f->params, f->count, f->hex);
+    }
     /* Oversized and unknown report ids must be rejected. */
     {
         uint8_t big[16] = { 0 };
@@ -141,26 +175,17 @@ int main(void) {
         }
     }
 
-    check_reply("match getHostInfo",
-                "11ff0a0a03010000000000000000000000000000", 0xFF, 0x0A, REPLY_MATCH);
-    check_reply("match root getFeature",
-                "11ff000a0a000400000000000000000000000000", 0xFF, 0x00, REPLY_MATCH);
-    check_reply("match battery",
-                "11ff050a58010000000000000000000000000000", 0xFF, 0x05, REPLY_MATCH);
-    check_reply("notification ignored",
-                "11ff050a00000000000000000000000000000000", 0xFF, 0x0A, REPLY_IGNORE);
-    check_reply("other device ignored",
-                "11010a0a03010000000000000000000000000000", 0xFF, 0x0A, REPLY_IGNORE);
-    check_reply("other sw id ignored",
-                "11ff0a1b03010000000000000000000000000000", 0xFF, 0x0A, REPLY_IGNORE);
-    check_reply("HID++ 2.0 error",
-                "11ffff0a00000000000000000000000000000000", 0xFF, 0x0A, REPLY_ERROR);
-    check_reply("HID++ 1.0 error",
-                "11ff8f0a00000000000000000000000000000000", 0xFF, 0x0A, REPLY_ERROR);
-    check_reply("too short", "11ff0a", 0xFF, 0x0A, REPLY_TOO_SHORT);
+    for (size_t i = 0; i < sizeof(fixture_replies)/sizeof(fixture_replies[0]); i++) {
+        const struct fixture_reply *r = &fixture_replies[i];
+        int expected = !strcmp(r->outcome, "match") ? REPLY_MATCH :
+                       !strcmp(r->outcome, "error") ? REPLY_ERROR :
+                       !strcmp(r->outcome, "too_short") ? REPLY_TOO_SHORT : REPLY_IGNORE;
+        check_reply(r->name, r->hex, r->didx, r->fidx, r->function, expected);
+    }
 
     check_config();
     check_name();
+    check_discovery();
 
     if (fails) {
         printf("\n%d test(s) failed\n", fails);

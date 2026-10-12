@@ -24,6 +24,7 @@ Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 partial --all failure.
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,7 @@ POP_ICON_KEYS_BT_PID = 0xB38F  # Windows may omit its HID product string over BT
 SW_ID = 0x0A                  # software id, any value 1..15
 ROOT_FEATURE = 0x00
 FEAT_CHANGE_HOST = 0x1814
+FEAT_DEVICE_NAME = 0x0005
 FEAT_DEVICE_FW = 0x0003       # DEVICE_FW_VERSION, for --status
 FEAT_BATTERY_UNIFIED = 0x1004  # UNIFIED_BATTERY
 FEAT_BATTERY_LEVEL = 0x1000    # BATTERY_LEVEL_STATUS
@@ -60,20 +62,26 @@ def build_frame(report_id, dev_idx, feature_idx, function, params=b"", sw_id=SW_
     return frame.ljust(FRAME_LEN[report_id], b"\x00")
 
 
-def classify_reply(reply, dev_idx, feature_idx, sw_id=SW_ID):
-    """Match the reply-filtering rules documented in docs/protocol.md.
+def classify_reply(reply, dev_idx, feature_idx, sw_id=SW_ID, function=0):
+    """Match the device and complete request header, including error replies.
 
     Returns one of: "too_short", "ignore", "error", "match".
     """
     if len(reply) < 5:
         return "too_short"
-    if reply[1] != dev_idx:
+    if reply[0] not in FRAME_LEN:
+        return "ignore"
+    if len(reply) < FRAME_LEN[reply[0]]:
+        return "too_short"
+    if reply[1] != dev_idx and not (dev_idx == 0xFF and reply[1] == 0):
         return "ignore"
     if reply[2] in (0xFF, 0x8F):      # HID++ 2.0 / 1.0 error reply
-        return "error"
+        if len(reply) < 6:
+            return "too_short"
+        return "error" if reply[3:5] == bytes([feature_idx, (function << 4) | sw_id]) else "ignore"
     if reply[2] != feature_idx:
         return "ignore"               # unsolicited notification
-    if (reply[3] & 0x0F) != sw_id:
+    if reply[3] != (function << 4) | sw_id:
         return "ignore"
     return "match"
 
@@ -413,12 +421,15 @@ else:
 
 def request(dev, report_id, dev_idx, feature_idx, function, params=b"", timeout_ms=500):
     """Send one HID++ call and wait for its matching reply. None on timeout/error."""
-    dev.write(build_frame(report_id, dev_idx, feature_idx, function, params))
+    # Rotate request IDs so a late reply to the previous call is ignored.
+    sw_id = getattr(dev, "next_sw_id", SW_ID)
+    dev.next_sw_id = 8 + ((sw_id - 8 + 1) % 8)
+    dev.write(build_frame(report_id, dev_idx, feature_idx, function, params, sw_id))
 
     deadline = time.monotonic() + timeout_ms / 1000
     while time.monotonic() < deadline:
         reply = dev.read(timeout_ms=100)
-        outcome = classify_reply(reply, dev_idx, feature_idx)
+        outcome = classify_reply(reply, dev_idx, feature_idx, sw_id, function)
         if outcome == "match":
             return reply
         if outcome == "error":
@@ -433,54 +444,116 @@ def resolve_feature(dev, report_id, dev_idx, feature_id):
     return reply[4] if reply else 0
 
 
-def iter_devices(want_all, names=None):
-    """Yield discovered ChangeHost-capable devices, mouse first.
+def interface_identity(info):
+    """Group collections by OS device identity, never by model name."""
+    path = os.fsdecode(info["path"])
+    if sys.platform == "win32":
+        return re.sub(r"&col[0-9a-f]{2}", "", path.lower())
+    if sys.platform.startswith("linux"):
+        device = Path("/sys/class/hidraw") / Path(path).name / "device"
+        resolved = device.resolve()
+        for parent in (resolved, *resolved.parents):
+            if (parent / "idVendor").exists():
+                return str(parent)
+        return str(resolved) if device.exists() else path
+    return path
 
-    One physical device can expose several collections that all answer the
-    probe; only the first matching collection per (product, device index) is
-    yielded, so `--all` does not switch the same device twice. `names` limits
-    discovery to devices whose product name contains any of the substrings.
-    """
-    for info in enumerate_interfaces():
-        if not name_matches(info, names):
-            continue
-        try:
-            dev = Device(info)
-        except OSError:
-            continue
-        report_ids = [r for r in (LONG, SHORT)
-                      if not info["out_len"] or FRAME_LEN[r] <= info["out_len"]]
-        matched = False
-        for dev_idx in DEVICE_INDICES:
-            for report_id in report_ids:
+
+def device_metadata(dev, report_id, dev_idx, info):
+    """Use the peripheral's HID++ name and unit ID, not the receiver's name."""
+    product = info.get("product_string") or ""
+    if dev_idx != 0xFF:
+        product = f"{product or 'receiver'} (slot {dev_idx})"
+        idx = resolve_feature(dev, report_id, dev_idx, FEAT_DEVICE_NAME)
+        if idx:
+            reply = request(dev, report_id, dev_idx, idx, 0)
+            if reply and reply[4]:
+                length = reply[4]
+                raw = bytearray()
+                while len(raw) < length:
+                    fragment = request(dev, report_id, dev_idx, idx, 1, bytes([len(raw)]))
+                    if not fragment or len(fragment) <= 4:
+                        break
+                    raw.extend(fragment[4:4 + length - len(raw)])
+                if len(raw) == length:
+                    product = raw.decode("utf-8", errors="replace")
+    identity = (interface_identity(info), dev_idx)
+    idx = resolve_feature(dev, report_id, dev_idx, FEAT_DEVICE_FW)
+    if idx:
+        reply = request(dev, report_id, dev_idx, idx, 0)
+        if reply and len(reply) >= 9 and any(reply[5:9]):
+            identity = ("unit", reply[5:9].hex())
+    return dict(info, product_string=product), identity
+
+
+def close_devices(entries, keep=None):
+    closed = set()
+    for dev, *_ in entries:
+        if dev is not keep and id(dev) not in closed:
+            dev.close()
+            closed.add(id(dev))
+
+
+def iter_devices(want_all, names=None, verbose=False):
+    """Discover every receiver slot, deduplicate physical devices, then rank."""
+    found, opened, seen = [], [], set()
+    try:
+        for info in enumerate_interfaces():
+            preferred = False
+            try:
+                dev = Device(info)
+            except OSError:
+                continue
+            opened.append((dev,))
+            report_ids = [r for r in (LONG, SHORT)
+                          if not info["out_len"] or FRAME_LEN[r] <= info["out_len"]]
+            for dev_idx in DEVICE_INDICES:
+                match = None
+                for report_id in report_ids:
+                    if verbose:
+                        print(f"probing {info['product_string'] or 'device'} "
+                              f"index={dev_idx:#04x} report={report_id:#04x}", file=sys.stderr)
+                    try:
+                        idx = resolve_feature(dev, report_id, dev_idx, FEAT_CHANGE_HOST)
+                        if idx:
+                            match = (report_id, idx)
+                            break
+                    except OSError:
+                        continue
+                if not match:
+                    continue
+                report_id, feat_idx = match
                 try:
-                    reply = request(dev, report_id, dev_idx, ROOT_FEATURE, 0,
-                                    bytes([FEAT_CHANGE_HOST >> 8,
-                                           FEAT_CHANGE_HOST & 0xFF, 0x00]),
-                                    timeout_ms=250)
+                    metadata, key = device_metadata(dev, report_id, dev_idx, info)
                 except OSError:
                     continue
-                if reply and reply[4] != 0x00:
-                    matched = True
+                if key not in seen and name_matches(metadata, names):
+                    seen.add(key)
+                    found.append((dev, dev_idx, report_id, feat_idx, metadata))
+                    rank = device_rank(metadata["usage_page"] if dev_idx == 255 else 0,
+                                       metadata["usage"] if dev_idx == 255 else 0,
+                                       metadata["product_string"])
+                    if not want_all and rank < 10:
+                        preferred = True
+                        break
+                # A direct peripheral has no receiver slots to enumerate.
+                if dev_idx == 0xFF:
                     break
-            if matched:
+            if preferred:
                 break
-        if not matched:
-            dev.close()
-            continue
-
-        key = ((info["product_string"] or "").lower(), dev_idx)
-        if key in iter_devices.seen:
-            dev.close()
-            continue
-        iter_devices.seen.add(key)
-
-        yield dev, dev_idx, report_id, reply[4], info
-        if not want_all:
-            return
-
-
-iter_devices.seen = set()
+        found.sort(key=lambda d: device_rank(d[4]["usage_page"] if d[1] == 255 else 0,
+                                             d[4]["usage"] if d[1] == 255 else 0,
+                                             d[4]["product_string"]))
+        selected = found if want_all else found[:1]
+        retained = {id(d[0]) for d in selected}
+        for dev, in opened:
+            if id(dev) not in retained:
+                dev.close()
+        opened = []
+        yield from selected
+    except BaseException:
+        close_devices(opened)
+        raise
 
 
 def host_info(dev, dev_idx, report_id, feat_idx):
@@ -491,29 +564,33 @@ def host_info(dev, dev_idx, report_id, feat_idx):
 
 
 def battery_status(dev, dev_idx, report_id):
-    """(percent, charging) from whichever battery feature the device exposes."""
+    """Percent and charging state; omit unsupported/unknown percentages."""
     for feat_id in (FEAT_BATTERY_UNIFIED, FEAT_BATTERY_LEVEL):
         idx = resolve_feature(dev, report_id, dev_idx, feat_id)
         if not idx:
             continue
-        reply = request(dev, report_id, dev_idx, idx, 0, timeout_ms=300)
-        if reply and len(reply) >= 6:
-            return reply[4], bool(reply[5] & 0x01)
+        function = 1 if feat_id == FEAT_BATTERY_UNIFIED else 0
+        reply = request(dev, report_id, dev_idx, idx, function, timeout_ms=300)
+        if reply and len(reply) >= 7 and 0 < reply[4] <= 100:
+            return reply[4], reply[6] in (1, 2)
     return None
 
 
 def firmware_version(dev, dev_idx, report_id):
-    """Best-effort main firmware version from DEVICE_FW_VERSION."""
+    """Read the main firmware entity, including its hexadecimal build number."""
     idx = resolve_feature(dev, report_id, dev_idx, FEAT_DEVICE_FW)
     if not idx:
         return None
     reply = request(dev, report_id, dev_idx, idx, 0, timeout_ms=300)
-    if not reply or len(reply) < 8 or reply[4] == 0:
+    if not reply:
         return None
-    major, minor = reply[6], reply[7]
-    if major == 0 and minor == 0:
-        return None
-    return f"{major}.{minor}"
+    for entity in range(reply[4]):
+        reply = request(dev, report_id, dev_idx, idx, 1, bytes([entity]), timeout_ms=300)
+        if reply and len(reply) >= 12 and (reply[4] & 0x0F) == 0:
+            version = f"{reply[8]:02X}.{reply[9]:02X}"
+            build = int.from_bytes(reply[10:12], "big")
+            return version + (f".B{build:04X}" if build else "")
+    return None
 
 
 def set_host(dev, dev_idx, report_id, feat_idx, host_0based, dry_run=False):
@@ -538,13 +615,15 @@ def config_path():
 
 
 def load_config(path=None):
-    """key=value config. Missing file or malformed lines fall back to defaults."""
+    """Missing default file is optional; invalid values remain invalid."""
     cfg = dict(DEFAULT_CONFIG)
     p = Path(path) if path else config_path()
     try:
         text = p.read_text()
-    except OSError:
+    except FileNotFoundError:
         return cfg
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read config {p}: {exc}") from exc
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if not line or "=" not in line:
@@ -556,10 +635,9 @@ def load_config(path=None):
             cfg["name"] = [p.strip() for p in value.split(",") if p.strip()]
             continue
         if key in ("channel_a", "channel_b"):
-            try:
-                value = int(value)
-            except ValueError:
-                continue
+            value = int(value) if value in ("1", "2", "3") else 0
+        elif key == "device":
+            value = value.lower()
         if key in cfg:
             cfg[key] = value
     return cfg
@@ -644,6 +722,11 @@ def main():
     ap.add_argument("--verbose", action="store_true", help="explain what is probed")
     ap.add_argument("--config", metavar="PATH", help="config file path")
     args = ap.parse_args()
+    if any(not n for n in args.name or []):
+        ap.error("--name requires a nonempty substring")
+
+    if sum(bool(m) for m in (args.list, args.info, args.status, args.toggle, args.channel is not None)) > 1:
+        ap.error("give exactly one channel or mode (--info, --status, --toggle, --list)")
 
     if args.list:
         for i in enumerate_interfaces():
@@ -651,19 +734,18 @@ def main():
                   f"  out={i['out_len']}  {i['product_string']}")
         return 0
 
-    cfg = load_config(args.config)
+    if args.config and not Path(args.config).is_file():
+        ap.error(f"config file not found: {args.config}")
+    try:
+        cfg = load_config(args.config)
+    except ValueError as exc:
+        ap.error(str(exc))
     problems = validate_config(cfg)
-
-    modes = [args.info, args.status, args.toggle]
-    if sum(bool(m) for m in modes) > 1:
-        ap.error("--info, --status and --toggle are mutually exclusive")
+    if problems:
+        ap.error(f"invalid config {args.config or config_path()}: " + "; ".join(problems))
 
     want_all = args.all or cfg["device"] == "all"
 
-    if args.toggle and (problems or cfg["channel_a"] == cfg["channel_b"]):
-        sys.stderr.write("Cannot toggle: " + "; ".join(problems or
-                         ["channel_a and channel_b must differ"]) + "\n")
-        return 2
     if not args.info and not args.status and not args.toggle:
         if args.channel is None or not 1 <= args.channel <= 3:
             ap.error("channel must be 1, 2 or 3")
@@ -671,9 +753,8 @@ def main():
     if args.verbose:
         print(f"config     : {args.config or config_path()}", file=sys.stderr)
 
-    iter_devices.seen.clear()
     names = list(args.name or []) + list(cfg.get("name") or [])
-    devices = list(iter_devices(want_all, names))
+    devices = list(iter_devices(want_all, names, verbose=args.verbose))
     if not devices:
         print("No Logitech device supporting ChangeHost found.", file=sys.stderr)
         print("Click the mouse once to wake it, then retry. See also --list.",
@@ -746,8 +827,7 @@ def main():
             return 3
         return 0
     finally:
-        for dev, *_rest in devices:
-            dev.close()
+        close_devices(devices)
 
 
 if __name__ == "__main__":

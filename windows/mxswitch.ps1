@@ -42,6 +42,7 @@ param(
     [string]$Config,
 
     # Only act on devices whose product name contains one of these substrings.
+    [ValidateNotNullOrEmpty()]
     [string[]]$Name,
 
     # Skip the cached device paths and force a full rescan.
@@ -91,13 +92,20 @@ function New-HidppFrame {
 }
 
 function Get-ReplyVerdict {
-    param([byte[]]$Reply, [int]$DevIdx, [int]$FeatureIdx)
+    param([byte[]]$Reply, [int]$DevIdx, [int]$FeatureIdx, [int]$Function = 0, [int]$SwId = $SW_ID)
 
     if ($null -eq $Reply -or $Reply.Length -lt 5) { return 'too_short' }
-    if ($Reply[1] -ne $DevIdx) { return 'ignore' }
-    if ($Reply[2] -eq 0xFF -or $Reply[2] -eq 0x8F) { return 'error' }  # HID++ error
+    if ($Reply[0] -notin @(0x10, 0x11)) { return 'ignore' }
+    if ($Reply.Length -lt $FRAME_LEN[[int]$Reply[0]]) { return 'too_short' }
+    if ($Reply[1] -ne $DevIdx -and -not ($DevIdx -eq 255 -and $Reply[1] -eq 0)) { return 'ignore' }
+    $header = ($Function -shl 4) -bor $SwId
+    if ($Reply[2] -eq 0xFF -or $Reply[2] -eq 0x8F) {
+        if ($Reply.Length -lt 6) { return 'too_short' }
+        if ($Reply[3] -eq $FeatureIdx -and $Reply[4] -eq $header) { return 'error' }
+        return 'ignore'
+    }
     if ($Reply[2] -ne $FeatureIdx) { return 'ignore' }                 # notification
-    if (($Reply[3] -band 0x0F) -ne $SW_ID) { return 'ignore' }
+    if ($Reply[3] -ne $header) { return 'ignore' }
     return 'match'
 }
 
@@ -114,8 +122,8 @@ function Get-MxConfig {
             $key = $parts[0].Trim().ToLowerInvariant()
             $value = $parts[1].Trim()
             switch ($key) {
-                'channel_a' { if ($value -match '^[123]$') { $cfg.channel_a = [int]$value } }
-                'channel_b' { if ($value -match '^[123]$') { $cfg.channel_b = [int]$value } }
+                'channel_a' { $cfg.channel_a = if ($value -match '^[123]$') { [int]$value } else { 0 } }
+                'channel_b' { $cfg.channel_b = if ($value -match '^[123]$') { [int]$value } else { 0 } }
                 'device'    { $cfg.device = $value.ToLowerInvariant() }
                 'name'      { $cfg.name = $value }
             }
@@ -127,6 +135,9 @@ function Get-MxConfig {
 function Test-MxConfig {
     param($Config)
     $problems = @()
+    if ($Config.channel_a -notin @(1,2,3) -or $Config.channel_b -notin @(1,2,3)) {
+        $problems += 'channel_a and channel_b must be 1, 2 or 3'
+    }
     if ($Config.channel_a -eq $Config.channel_b) {
         $problems += 'channel_a and channel_b must differ'
     }
@@ -317,18 +328,23 @@ public class Hid {
     public void Close() { try { stream.Dispose(); } catch {} }
 }
 '@
+} # Native API definitions are not needed by hardware-free tests.
 
 function Invoke-HidppCall {
     param($Dev, [int]$ReportId, [int]$DevIdx, [int]$FeatureIdx, [int]$Function,
           [byte[]]$Params = @(), [int]$TimeoutMs = 400)
 
     $frame = New-HidppFrame $ReportId $DevIdx $FeatureIdx $Function $Params
+    $swId = if ($Dev.PSObject.Properties.Name -contains 'NextSwId') { $Dev.NextSwId } else { $SW_ID }
+    $next = 8 + (($swId - 8 + 1) % 8)
+    $Dev | Add-Member -NotePropertyName NextSwId -NotePropertyValue $next -Force
+    $frame[3] = ($Function -shl 4) -bor $swId
     if (-not $Dev.Write($frame)) { return $null }   # collection rejected it
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
         $r = $Dev.Read(100)
-        $verdict = Get-ReplyVerdict -Reply $r -DevIdx $DevIdx -FeatureIdx $FeatureIdx
+        $verdict = Get-ReplyVerdict -Reply $r -DevIdx $DevIdx -FeatureIdx $FeatureIdx -Function $Function -SwId $swId
         if ($verdict -eq 'match') { return $r }
         if ($verdict -eq 'error') { return $null }
     }
@@ -337,7 +353,7 @@ function Invoke-HidppCall {
 
 function Resolve-MxFeature {
     param($Dev, [int]$ReportId, [int]$DevIdx, [int]$FeatureId)
-    $probe = [byte[]]@(($FeatureId -shr 8) -band 0xFF, $FeatureId -band 0xFF, 0)
+    $probe = [byte[]]@((($FeatureId -shr 8) -band 0xFF), ($FeatureId -band 0xFF), 0)
     $r = Invoke-HidppCall $Dev $ReportId $DevIdx 0 0 $probe 300
     if ($r) { return [int]$r[4] }
     return 0
@@ -369,9 +385,9 @@ function Test-MxName {
 # Over Bluetooth some devices (POP Icon Keys) report an empty HID product
 # string on Windows; fill in the known name so ranking and -Name still work.
 function Resolve-MxProduct {
-    param([string]$Product, [int]$Pid)
+    param([string]$Product, [int]$ProductId)
     if ($Product) { return $Product }
-    if ($Pid -eq 0xB38F) { return 'POP Icon Keys' }
+    if ($ProductId -eq 0xB38F) { return 'POP Icon Keys' }
     return ''
 }
 
@@ -442,77 +458,116 @@ function Save-CachedDevices {
     } catch { Write-Verbose 'could not write cache' }
 }
 
-# Returns an array of contexts. With -All, every unique ChangeHost device.
-function Find-MxDevices {
-    param([switch]$All, [string[]]$Names)
+function Get-MxInterfaces { [Hid]::Enumerate($VID) }
+function Open-MxDevice { param($Iface) New-Object Hid $Iface }
 
-    $cached = @(Get-CachedDevices)
-    # A name filter cannot be answered from the cache, which may only hold the
-    # primary device, so rescan when one is set.
-    if ($cached.Count -gt 0 -and $Names -and $Names.Count -gt 0) {
-        foreach ($c in $cached) { $c.Dev.Close() }
-        $cached = @()
-    }
-    if ($cached.Count -gt 0) {
-        # A cache written by a non-All run may hold only the primary device, so
-        # never satisfy -All from it. Rescan to find every device.
-        if ($All) {
-            foreach ($c in $cached) { $c.Dev.Close() }
-        } elseif ((Get-DeviceRank $cached[0].Iface.UsagePage `
-                    $cached[0].Iface.Usage $cached[0].Iface.Product) -lt 20) {
-            # Prefer a live mouse over a cached keyboard.
-            Write-Verbose 'using cached device'
-            for ($i = 1; $i -lt $cached.Count; $i++) { $cached[$i].Dev.Close() }
-            return @($cached[0])
-        } else {
-            foreach ($c in $cached) { $c.Dev.Close() }
+function Close-MxDevices {
+    param($Contexts, $Keep = $null)
+    $closed = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($c in $Contexts) {
+        if ([object]::ReferenceEquals($c.Dev, $Keep)) { continue }
+        $shared = $false
+        foreach ($dev in $closed) {
+            if ([object]::ReferenceEquals($dev, $c.Dev)) { $shared = $true; break }
         }
+        if (-not $shared) { $c.Dev.Close(); $closed.Add($c.Dev) }
     }
+}
 
-    $ifaces = [Hid]::Enumerate($VID) |
-        ForEach-Object { $_.Product = Resolve-MxProduct $_.Product $_.Pid; $_ } |
-        Where-Object { Test-MxName $_.Product $Names } |
-        Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product }
-
-    $contexts = @()
-    $seen = @{}
-    foreach ($iface in $ifaces) {
-        if (-not $All -and $contexts.Count -gt 0) { break }
-        Write-Verbose ("probing {0:x4}:{1:x4} out={2} {3}" -f `
-            $iface.UsagePage, $iface.Usage, $iface.OutLen, $iface.Product)
-
-        try { $dev = New-Object Hid $iface } catch { continue }
-
-        # Try the report ID whose frame size matches this collection first; the
-        # other is attempted only in case one collection declares both.
-        $reportIds = @(0x11, 0x10) | Sort-Object `
-            @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $iface.OutLen) { 0 } else { 1 } } }
-
-        $matched = $false
-        foreach ($didx in $DEVICE_INDICES) {
-            if ($matched) { break }
-            foreach ($rid in $reportIds) {
-                $r = Invoke-HidppCall $dev $rid $didx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
-                if ($r -and $r[4] -ne 0) {
-                    $key = "$($iface.Product.ToLowerInvariant())|$didx"
-                    if (-not $seen.ContainsKey($key)) {
-                        Write-Verbose ("matched index=0x{0:x2} report=0x{1:x2}" -f $didx, $rid)
-                        $seen[$key] = $true
-                        $contexts += [pscustomobject]@{ Dev = $dev; ReportId = $rid
-                                                        DevIdx = $didx; FeatureIdx = $r[4]
-                                                        Iface = $iface }
-                    } else {
-                        $dev.Close()
-                    }
-                    $matched = $true
-                    break
+function Get-MxMetadata {
+    param($Dev, $Iface, [int]$ReportId, [int]$DevIdx)
+    $product = Resolve-MxProduct $Iface.Product $Iface.Pid
+    $identity = ($Iface.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', '') + ":$DevIdx"
+    if ($DevIdx -ne 255) {
+        $product = "receiver (slot $DevIdx)"
+        $idx = Resolve-MxFeature $Dev $ReportId $DevIdx 0x0005
+        if ($idx) {
+            $r = Invoke-HidppCall $Dev $ReportId $DevIdx $idx 0
+            if ($r -and $r[4]) {
+                $length = [int]$r[4]
+                $bytes = New-Object 'System.Collections.Generic.List[byte]'
+                while ($bytes.Count -lt $length) {
+                    $fragment = Invoke-HidppCall $Dev $ReportId $DevIdx $idx 1 ([byte[]]@($bytes.Count))
+                    if (-not $fragment -or $fragment.Length -le 4) { break }
+                    $n = [Math]::Min($fragment.Length - 4, $length - $bytes.Count)
+                    for ($i = 0; $i -lt $n; $i++) { $bytes.Add($fragment[4+$i]) }
                 }
+                if ($bytes.Count -eq $length) { $product = [Text.Encoding]::UTF8.GetString($bytes.ToArray()) }
             }
         }
-        if (-not $matched) { $dev.Close() }
     }
-    if ($contexts.Count -gt 0) { Save-CachedDevices $contexts }
-    return $contexts
+    $idx = Resolve-MxFeature $Dev $ReportId $DevIdx 0x0003
+    if ($idx) {
+        $r = Invoke-HidppCall $Dev $ReportId $DevIdx $idx 0
+        if ($r -and $r.Length -ge 9 -and ($r[5] -or $r[6] -or $r[7] -or $r[8])) {
+            $identity = 'unit:' + (Format-Hex ([byte[]]$r[5..8]))
+        }
+    }
+    [pscustomobject]@{ Product = $product; Identity = $identity }
+}
+
+# Every slot is discovered before filtering and ranking the peripherals.
+function Find-MxDevices {
+    param([switch]$All, [string[]]$Names)
+    $cached = @(Get-CachedDevices)
+    if ($cached.Count -gt 0 -and -not $All -and -not $Names) {
+        $first = $cached[0]
+        $metadata = Get-MxMetadata $first.Dev $first.Iface $first.ReportId $first.DevIdx
+        $first.Iface.Product = $metadata.Product
+        if ((Get-DeviceRank $first.Iface.UsagePage $first.Iface.Usage $metadata.Product) -lt 10) {
+            Close-MxDevices $cached -Keep $first.Dev
+            return @($first)
+        }
+    }
+    Close-MxDevices $cached
+    $contexts = @(); $opened = @(); $seen = @{}
+    try {
+        $ifaces = @(Get-MxInterfaces | Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product })
+        foreach ($iface in $ifaces) {
+            $preferred = $false
+            try { $dev = Open-MxDevice $iface } catch { continue }
+            $opened += [pscustomobject]@{ Dev = $dev }
+            $reportIds = @(0x11, 0x10) | Where-Object { $FRAME_LEN[[int]$_] -le $iface.OutLen } |
+                Sort-Object @{ Expression = { if ($FRAME_LEN[[int]$_] -eq $iface.OutLen) { 0 } else { 1 } } }
+            foreach ($didx in $DEVICE_INDICES) {
+                $matched = $false
+                foreach ($rid in $reportIds) {
+                    Write-Verbose ("probing {0} index=0x{1:x2} report=0x{2:x2}" -f $iface.Product, $didx, $rid)
+                    $idx = Resolve-MxFeature $dev $rid $didx 0x1814
+                    if ($idx) { $matched = $true; break }
+                }
+                if (-not $matched) { continue }
+                $metadata = Get-MxMetadata $dev $iface $rid $didx
+                if (-not $seen.ContainsKey($metadata.Identity) -and (Test-MxName $metadata.Product $Names)) {
+                    $seen[$metadata.Identity] = $true
+                    # Each peripheral needs its own product name, even on a shared handle.
+                    $deviceIface = [pscustomobject]@{ Path = $iface.Path; Product = $metadata.Product
+                        UsagePage = $(if ($didx -eq 255) { $iface.UsagePage } else { 0 });
+                        Usage = $(if ($didx -eq 255) { $iface.Usage } else { 0 }); Pid = $iface.Pid
+                        InLen = $iface.InLen; OutLen = $iface.OutLen }
+                    $contexts += [pscustomobject]@{ Dev = $dev; ReportId = $rid; DevIdx = $didx
+                        FeatureIdx = $idx; Iface = $deviceIface }
+                    if (-not $All -and (Get-DeviceRank $deviceIface.UsagePage $deviceIface.Usage $deviceIface.Product) -lt 10) {
+                        $preferred = $true; break
+                    }
+                }
+                if ($didx -eq 255) { break }
+            }
+            if ($preferred) { break }
+        }
+        $contexts = @($contexts | Sort-Object { Get-DeviceRank $_.Iface.UsagePage $_.Iface.Usage $_.Iface.Product })
+        if (-not $All -and $contexts.Count -gt 1) { $contexts = @($contexts[0]) }
+        foreach ($o in $opened) {
+            $retained = $false
+            foreach ($c in $contexts) {
+                if ([object]::ReferenceEquals($c.Dev, $o.Dev)) { $retained = $true; break }
+            }
+            if (-not $retained) { $o.Dev.Close() }
+        }
+        $opened = @()
+        if ($contexts.Count) { Save-CachedDevices $contexts }
+        return $contexts
+    } catch { Close-MxDevices $opened; throw }
 }
 
 function Get-MxStatus {
@@ -533,18 +588,28 @@ function Get-MxStatus {
         foreach ($fid in 0x1004, 0x1000) {
             $idx = Resolve-MxFeature $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $fid
             if (-not $idx) { continue }
-            $r = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $idx 0
-            if ($r) {
+            $function = if ($fid -eq 0x1004) { 1 } else { 0 }
+            $r = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $idx $function
+            if ($r -and $r.Length -ge 7 -and $r[4] -gt 0 -and $r[4] -le 100) {
                 $o.battery_percent = $r[4]
-                $o.charging = [bool]($r[5] -band 0x01)
+                $o.charging = $r[6] -in @(1,2)
                 break
             }
         }
         $fw = Resolve-MxFeature $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx 0x0003
         if ($fw) {
             $r = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $fw 0
-            if ($r -and $r[4] -gt 0 -and ($r[6] -or $r[7])) {
-                $o.firmware = "$($r[6]).$($r[7])"
+            if ($r) {
+                $count = [int]$r[4]
+                for ($entity = 0; $entity -lt $count; $entity++) {
+                    $r = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $fw 1 ([byte[]]@($entity))
+                    if ($r -and $r.Length -ge 12 -and ($r[4] -band 15) -eq 0) {
+                        $o.firmware = '{0:X2}.{1:X2}' -f $r[8], $r[9]
+                        $build = ([int]$r[10] -shl 8) -bor $r[11]
+                        if ($build) { $o.firmware += '.B{0:X4}' -f $build }
+                        break
+                    }
+                }
             }
         }
     }
@@ -573,8 +638,31 @@ function Show-MxHuman {
 # Main
 # ---------------------------------------------------------------------------
 
+function Invoke-Switch {
+    param($Ctx, [int]$TargetChannel, [int]$Attempts = 4)
+
+    $current = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 0
+    if ($current -and $current.Length -ge 6 -and ($current[5] + 1) -eq $TargetChannel) { return $true }
+    $frame = New-HidppFrame $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        Write-Verbose "switch attempt $attempt"
+        if ($Ctx.Dev.Write($frame)) {
+            Start-Sleep -Milliseconds 250
+            $still = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx `
+                                      $Ctx.FeatureIdx 0 @() 250
+            if (-not $still -or ($still.Length -ge 6 -and ($still[5] + 1) -eq $TargetChannel)) { return $true }        # gone: it worked
+            Write-Verbose 'device still responding, retrying'
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
+
+if (-not $env:MXSWITCH_TEST) {
+
 $modes = @(@($Info, $Status, $List, $Toggle) | Where-Object { $_ })
-if ($modes.Count -gt 1) {
+if ($modes.Count + [int]$PSBoundParameters.ContainsKey('Channel') -gt 1) {
     Write-MxError '-Info, -Status, -List and -Toggle are mutually exclusive'
     exit 2
 }
@@ -590,8 +678,13 @@ if ($List) {
     exit 0
 }
 
+if ($Config -and -not (Test-Path -LiteralPath $Config -PathType Leaf)) {
+    Write-MxError "Config file not found: $Config"; exit 2
+}
 $cfg = Get-MxConfig -Path $(if ($Config) { $Config } else { $ConfigFile })
-if ($Config) { Write-Verbose "config: $Config" }
+Write-Verbose "config: $(if ($Config) { $Config } else { $ConfigFile })"
+$problems = @(Test-MxConfig $cfg)
+if ($problems.Count) { Write-MxError ("Invalid config: " + ($problems -join '; ')); exit 2 }
 $wantAll = $All -or $cfg.device -eq 'all'
 
 # Union of -Name and the config `name` list.
@@ -602,15 +695,11 @@ if ($cfg.name) {
 }
 $nameFilter = @(@($Name) + $cfgNames | Where-Object { $_ })
 
-if ($Toggle) {
-    $problems = @(Test-MxConfig $cfg)
-    if ($problems.Count -gt 0) {
-        Write-MxError ("Cannot toggle: " + ($problems -join '; '))
-        exit 2
-    }
-} elseif (-not $Info -and -not $Status -and -not $Channel) {
-    Write-MxError 'Give -Channel 1..3, -Info, -Status, -Toggle or -List'
-    exit 2
+if (-not $Toggle -and -not $Info -and -not $Status -and -not $Channel) {
+    Write-MxError 'Give -Channel 1..3, -Info, -Status, -Toggle or -List'; exit 2
+}
+if (-not $Toggle -and -not $Info -and -not $Status -and $Channel -notin @(1,2,3)) {
+    Write-MxError 'Channel must be 1, 2 or 3'; exit 2
 }
 
 $found = @(Find-MxDevices -All:$wantAll -Names $nameFilter)
@@ -631,7 +720,7 @@ if ($Info -or $Status) {
             Show-MxHuman $reports[$i]
         }
     }
-    foreach ($c in $found) { $c.Dev.Close() }
+    Close-MxDevices $found
     exit 0
 }
 
@@ -640,7 +729,7 @@ if ($Toggle) {
                           $found[0].FeatureIdx 0
     if (-not $h) {
         Write-MxError 'Could not read the current channel.'
-        foreach ($c in $found) { $c.Dev.Close() }
+        Close-MxDevices $found
         exit 1
     }
     $current = $h[5] + 1
@@ -649,14 +738,14 @@ if ($Toggle) {
     else {
         Write-MxError ("Current channel $current is not in the configured pair " +
                        "$($cfg.channel_a),$($cfg.channel_b). Refusing to guess.")
-        foreach ($c in $found) { $c.Dev.Close() }
+        Close-MxDevices $found
         exit 1
     }
 }
 
 if ($Channel -lt 1 -or $Channel -gt 3) {
     Write-MxError 'Channel must be 1, 2 or 3'
-    foreach ($c in $found) { $c.Dev.Close() }
+    Close-MxDevices $found
     exit 2
 }
 
@@ -665,7 +754,7 @@ if ($DryRun) {
         $frame = New-HidppFrame $c.ReportId $c.DevIdx $c.FeatureIdx 1 ([byte[]]@($Channel - 1))
         '{0}: switch to channel {1} -> {2}' -f $c.Iface.Product, $Channel, (Format-Hex $frame)
     }
-    foreach ($c in $found) { $c.Dev.Close() }
+    Close-MxDevices $found
     exit 0
 }
 
@@ -679,23 +768,6 @@ if ($DryRun) {
     So verify by absence. After the switch the device should stop answering; if
     it still replies to getHostInfo, the frame did not land and we try again.
 #>
-function Invoke-Switch {
-    param($Ctx, [int]$TargetChannel, [int]$Attempts = 4)
-
-    $frame = New-HidppFrame $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        Write-Verbose "switch attempt $attempt"
-        if ($Ctx.Dev.Write($frame)) {
-            Start-Sleep -Milliseconds 250
-            $still = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx `
-                                      $Ctx.FeatureIdx 0 @() 250
-            if (-not $still) { return $true }        # gone: it worked
-            Write-Verbose 'device still responding, retrying'
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    return $false
-}
 
 "Switching to channel $Channel ..."
 $failures = 0
@@ -707,7 +779,7 @@ foreach ($c in $found) {
         $failures++
     }
 }
-foreach ($c in $found) { $c.Dev.Close() }
+Close-MxDevices $found
 
 if ($failures -eq 0) { exit 0 }
 if ($failures -eq $found.Count) { exit 1 }

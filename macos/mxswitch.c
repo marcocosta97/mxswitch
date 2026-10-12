@@ -44,13 +44,14 @@ extern char **environ;
 #define SW_ID             0x0A
 #define ROOT_FEATURE      0x00
 #define FEAT_CHANGE_HOST  0x1814
+#define FEAT_DEVICE_NAME  0x0005
 #define FEAT_DEVICE_FW    0x0003
 #define FEAT_BATTERY_UNIFIED 0x1004
 #define FEAT_BATTERY_LEVEL   0x1000
 
 #define REPORT_SHORT 0x10
 #define REPORT_LONG  0x11
-#define MAX_DEVICES  8
+#define MAX_DEVICES  64
 
 static const uint8_t DEVICE_INDICES[] = { 0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 };
 
@@ -88,14 +89,20 @@ static size_t frame_build(uint8_t report_id, uint8_t dev_idx, uint8_t feature_id
     return len;
 }
 
-/* Match the reply-filtering rules in docs/protocol.md. */
+/* Match the complete request header, including the original header in errors. */
 static int classify_reply(const uint8_t *reply, size_t len,
-                          uint8_t dev_idx, uint8_t feature_idx) {
+                          uint8_t dev_idx, uint8_t feature_idx, uint8_t function, uint8_t sw_id) {
     if (len < 5) return REPLY_TOO_SHORT;
-    if (reply[1] != dev_idx) return REPLY_IGNORE;
-    if (reply[2] == 0xFF || reply[2] == 0x8F) return REPLY_ERROR;
+    if (reply[0] != REPORT_SHORT && reply[0] != REPORT_LONG) return REPLY_IGNORE;
+    if (len < frame_len(reply[0])) return REPLY_TOO_SHORT;
+    if (reply[1] != dev_idx && !(dev_idx == 0xFF && reply[1] == 0)) return REPLY_IGNORE;
+    uint8_t header = (uint8_t)((function << 4) | sw_id);
+    if (reply[2] == 0xFF || reply[2] == 0x8F) {
+        if (len < 6) return REPLY_TOO_SHORT;
+        return reply[3] == feature_idx && reply[4] == header ? REPLY_ERROR : REPLY_IGNORE;
+    }
     if (reply[2] != feature_idx) return REPLY_IGNORE;
-    if ((reply[3] & 0x0F) != SW_ID) return REPLY_IGNORE;
+    if (reply[3] != header) return REPLY_IGNORE;
     return REPLY_MATCH;
 }
 
@@ -146,6 +153,11 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
                              params, nparams, frame);
     if (!len) return 0;
 
+    static uint8_t next_sw_id = SW_ID;
+    uint8_t sw_id = next_sw_id;
+    next_sw_id = (uint8_t)(8 + ((sw_id - 8 + 1) % 8));
+    frame[3] = (uint8_t)((function << 4) | sw_id);
+
     /* Report ID goes both in the buffer and as its own argument - this is what
      * hidapi does on macOS and what Logitech devices expect. */
     if (IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, report_id,
@@ -161,7 +173,7 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
         if (!g_got_reply || g_reply_len < 5) continue;
         if (g_reply_dev != dev) continue;   /* another open device spoke */
-        int verdict = classify_reply(g_reply, (size_t)g_reply_len, dev_idx, feature_idx);
+        int verdict = classify_reply(g_reply, (size_t)g_reply_len, dev_idx, feature_idx, function, sw_id);
         if (verdict == REPLY_IGNORE || verdict == REPLY_TOO_SHORT) continue;
         if (verdict == REPLY_ERROR) return 0;
         memcpy(out, g_reply, (size_t)g_reply_len);
@@ -186,27 +198,33 @@ static uint8_t resolve_feature(IOHIDDeviceRef dev, uint8_t report_id,
 
 typedef struct {
     uint8_t dev_idx, report_id, feature_idx;
-    char name[128];
+    char name[256];
+    char identity[256];
+    int rank;
 } device_info_t;
 
 typedef struct {
     IOHIDManagerRef mgr;          /* kept alive while any dev is open */
     IOHIDDeviceRef devs[MAX_DEVICES];
     device_info_t info[MAX_DEVICES];
+    uint8_t *rxbufs[MAX_DEVICES];
     int count;
 } device_set_t;
 
+static void device_close(IOHIDDeviceRef dev, uint8_t *rxbuf) {
+    IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    IOHIDDeviceClose(dev, kIOHIDOptionsTypeNone);
+    free(rxbuf);
+}
+
 static void devices_release(device_set_t *set) {
     for (int i = 0; i < set->count; i++) {
-        IOHIDDeviceUnscheduleFromRunLoop(set->devs[i], CFRunLoopGetCurrent(),
-                                         kCFRunLoopDefaultMode);
-        IOHIDDeviceClose(set->devs[i], kIOHIDOptionsTypeNone);
+        int shared = 0;
+        for (int k = 0; k < i; k++) if (set->devs[k] == set->devs[i]) shared = 1;
+        if (!shared) device_close(set->devs[i], set->rxbufs[i]);
     }
     set->count = 0;
-    if (set->mgr) {
-        CFRelease(set->mgr);
-        set->mgr = NULL;
-    }
+    if (set->mgr) { CFRelease(set->mgr); set->mgr = NULL; }
 }
 
 /* Lower rank = try first. Mice before keyboards; vendor pages before others. */
@@ -245,128 +263,168 @@ static int cand_cmp(const void *a, const void *b) {
     return ((const cand_t *)a)->rank - ((const cand_t *)b)->rank;
 }
 
-/*
- * Discover ChangeHost-capable devices. With want_all set, every unique device
- * (deduped by name + device index) is collected; otherwise the first ranked
- * one. When names are given, only devices whose product name contains one of
- * them are considered. Returns the number of devices in *set.
- */
+/* The USB ancestor groups HID collections belonging to one receiver. */
+static uint64_t physical_id(IOHIDDeviceRef dev) {
+    io_service_t service = IOHIDDeviceGetService(dev);
+    uint64_t fallback = (uint64_t)(uintptr_t)dev;
+    if (!service) return fallback;
+    IORegistryEntryGetRegistryEntryID(service, &fallback);
+    io_registry_entry_t entry = service;
+    IOObjectRetain(entry);
+    while (entry) {
+        if (IOObjectConformsTo(entry, "IOUSBHostDevice") ||
+            IOObjectConformsTo(entry, "IOUSBDevice")) {
+            uint64_t result = fallback;
+            IORegistryEntryGetRegistryEntryID(entry, &result);
+            IOObjectRelease(entry);
+            return result;
+        }
+        io_registry_entry_t parent = 0;
+        IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent);
+        IOObjectRelease(entry);
+        entry = parent;
+    }
+    return fallback;
+}
+
+static void device_metadata(IOHIDDeviceRef dev, device_info_t *di, uint64_t physical) {
+    uint8_t reply[64];
+    size_t len = 0;
+    snprintf(di->identity, sizeof(di->identity), "%llu:%u",
+             (unsigned long long)physical, di->dev_idx);
+    if (di->dev_idx != 0xFF) {
+        snprintf(di->name, sizeof(di->name), "receiver (slot %u)", di->dev_idx);
+        uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_NAME);
+        if (idx && hidpp_call(dev, di->report_id, di->dev_idx, idx, 0, NULL, 0,
+                              reply, &len, 0.3) && len >= 5 && reply[4]) {
+            size_t total = reply[4], used = 0;
+            char name[256];
+            while (used < total) {
+                uint8_t offset = (uint8_t)used;
+                if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, 1, &offset, 1,
+                                reply, &len, 0.3) || len <= 4) break;
+                size_t n = len - 4;
+                if (n > total - used) n = total - used;
+                memcpy(name + used, reply + 4, n);
+                used += n;
+            }
+            if (used == total) {
+                name[used] = '\0';
+                snprintf(di->name, sizeof(di->name), "%s", name);
+            }
+        }
+    }
+    uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_FW);
+    if (idx && hidpp_call(dev, di->report_id, di->dev_idx, idx, 0, NULL, 0,
+                          reply, &len, 0.3) && len >= 9 &&
+        (reply[5] || reply[6] || reply[7] || reply[8]))
+        snprintf(di->identity, sizeof(di->identity), "unit:%02x%02x%02x%02x",
+                 reply[5], reply[6], reply[7], reply[8]);
+}
+
+static void devices_sort(device_set_t *set) {
+    for (int i = 1; i < set->count; i++) {
+        for (int j = i; j > 0 && set->info[j].rank < set->info[j-1].rank; j--) {
+            device_info_t info = set->info[j];
+            set->info[j] = set->info[j-1]; set->info[j-1] = info;
+            IOHIDDeviceRef dev = set->devs[j];
+            set->devs[j] = set->devs[j-1]; set->devs[j-1] = dev;
+            uint8_t *rx = set->rxbufs[j];
+            set->rxbufs[j] = set->rxbufs[j-1]; set->rxbufs[j-1] = rx;
+        }
+    }
+}
+
+/* Discover all slots before filtering/ranking; collections share one open handle. */
 static int find_devices(device_set_t *set, int want_all, int verbose,
                         const char *const *names, int name_count) {
     memset(set, 0, sizeof(*set));
-
-    IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
-                                             kIOHIDOptionsTypeNone);
+    IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
     if (!mgr) return 0;
     IOHIDManagerSetDeviceMatching(mgr, NULL);
-
     CFSetRef cset = IOHIDManagerCopyDevices(mgr);
     if (!cset) { CFRelease(mgr); return 0; }
-
     CFIndex count = CFSetGetCount(cset);
-    IOHIDDeviceRef *devices = calloc((size_t)count, sizeof(IOHIDDeviceRef));
+    IOHIDDeviceRef *devices = calloc((size_t)count + 1, sizeof(*devices));
+    cand_t *cands = calloc((size_t)count + 1, sizeof(*cands));
+    if (!devices || !cands) {
+        free(devices); free(cands); CFRelease(cset); CFRelease(mgr); return 0;
+    }
     CFSetGetValues(cset, (const void **)devices);
-
-    cand_t *cands = calloc((size_t)count, sizeof(cand_t));
     CFIndex ncand = 0;
-
     for (CFIndex i = 0; i < count; i++) {
         IOHIDDeviceRef d = devices[i];
         if (prop_int(d, CFSTR(kIOHIDVendorIDKey)) != LOGITECH_VID) continue;
-
-        int32_t usage_page = prop_int(d, CFSTR(kIOHIDPrimaryUsagePageKey));
-        int32_t usage      = prop_int(d, CFSTR(kIOHIDPrimaryUsageKey));
-        int32_t max_in = prop_int(d, CFSTR(kIOHIDMaxInputReportSizeKey));
-        if (max_in <= 0 || max_in > 64) max_in = 64;
-
-        char name[128] = "(unnamed)";
-        CFStringRef p = IOHIDDeviceGetProperty(d, CFSTR(kIOHIDProductKey));
-        if (p && CFGetTypeID(p) == CFStringGetTypeID())
-            CFStringGetCString(p, name, sizeof(name), kCFStringEncodingUTF8);
-
-        if (!name_matches(name, names, name_count)) continue;
-
-        cands[ncand].dev = d;
-        cands[ncand].usage_page = usage_page;
-        cands[ncand].usage = usage;
-        cands[ncand].max_in = max_in;
-        cands[ncand].rank = device_rank(usage_page, usage, name);
-        snprintf(cands[ncand].name, sizeof(cands[ncand].name), "%s", name);
-        ncand++;
+        cand_t *c = &cands[ncand++];
+        c->dev = d;
+        c->usage_page = prop_int(d, CFSTR(kIOHIDPrimaryUsagePageKey));
+        c->usage = prop_int(d, CFSTR(kIOHIDPrimaryUsageKey));
+        c->max_in = prop_int(d, CFSTR(kIOHIDMaxInputReportSizeKey));
+        if (c->max_in <= 0 || c->max_in > 64) c->max_in = 64;
+        snprintf(c->name, sizeof(c->name), "(unnamed)");
+        CFStringRef product = IOHIDDeviceGetProperty(d, CFSTR(kIOHIDProductKey));
+        if (product && CFGetTypeID(product) == CFStringGetTypeID())
+            CFStringGetCString(product, c->name, sizeof(c->name), kCFStringEncodingUTF8);
+        c->rank = device_rank(c->usage_page, c->usage, c->name);
     }
-
     free(devices);
     CFRelease(cset);
-
-    qsort(cands, (size_t)ncand, sizeof(cand_t), cand_cmp);
-
+    qsort(cands, (size_t)ncand, sizeof(*cands), cand_cmp);
     for (CFIndex i = 0; i < ncand; i++) {
-        if (!want_all && set->count > 0) break;
-        IOHIDDeviceRef d = cands[i].dev;
-        int32_t max_in = cands[i].max_in;
-
-        if (IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) != kIOReturnSuccess)
-            continue;
-
-        static uint8_t rxbuf[64];
-        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, max_in, input_cb, NULL);
-        IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(),
-                                       kCFRunLoopDefaultMode);
-
-        const uint8_t probe[3] = { FEAT_CHANGE_HOST >> 8, FEAT_CHANGE_HOST & 0xFF, 0 };
-        const uint8_t rids[2] = { REPORT_LONG, REPORT_SHORT };
-        uint8_t reply[64];
-        int matched = 0;
-        uint8_t m_dev_idx = 0, m_report_id = 0, m_feature_idx = 0;
-
-        for (size_t a = 0; a < sizeof(DEVICE_INDICES) && !matched; a++) {
-            for (size_t b = 0; b < 2 && !matched; b++) {
-                if (verbose)
-                    fprintf(stderr, "probing %s index=0x%02x report=0x%02x\n",
-                            cands[i].name, DEVICE_INDICES[a], rids[b]);
-                if (!hidpp_call(d, rids[b], DEVICE_INDICES[a], ROOT_FEATURE, 0,
-                                probe, 3, reply, NULL, 0.25))
-                    continue;
-                if (reply[4] == 0) continue;     /* feature not supported */
-                matched = 1;
-                m_dev_idx = DEVICE_INDICES[a];
-                m_report_id = rids[b];
-                m_feature_idx = reply[4];
+        cand_t *c = &cands[i];
+        IOHIDDeviceRef d = c->dev;
+        if (IOHIDDeviceOpen(d, kIOHIDOptionsTypeNone) != kIOReturnSuccess) continue;
+        uint8_t *rxbuf = calloc(64, 1);
+        if (!rxbuf) { IOHIDDeviceClose(d, kIOHIDOptionsTypeNone); continue; }
+        IOHIDDeviceRegisterInputReportCallback(d, rxbuf, c->max_in, input_cb, NULL);
+        IOHIDDeviceScheduleWithRunLoop(d, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+        int retained = 0, preferred = 0;
+        uint64_t physical = physical_id(d);
+        for (size_t a = 0; a < sizeof(DEVICE_INDICES); a++) {
+            device_info_t di = { 0 };
+            di.dev_idx = DEVICE_INDICES[a];
+            snprintf(di.name, sizeof(di.name), "%s", c->name);
+            const uint8_t rids[] = { REPORT_LONG, REPORT_SHORT };
+            for (size_t b = 0; b < 2; b++) {
+                if (verbose) fprintf(stderr, "probing %s index=0x%02x report=0x%02x\n",
+                                     c->name, di.dev_idx, rids[b]);
+                di.feature_idx = resolve_feature(d, rids[b], di.dev_idx, FEAT_CHANGE_HOST);
+                if (di.feature_idx) { di.report_id = rids[b]; break; }
             }
+            if (!di.feature_idx) continue;
+            device_metadata(d, &di, physical);
+            di.rank = device_rank(di.dev_idx == 255 ? c->usage_page : 0,
+                                  di.dev_idx == 255 ? c->usage : 0, di.name);
+            int duplicate = 0;
+            for (int k = 0; k < set->count; k++)
+                if (!strcmp(set->info[k].identity, di.identity)) duplicate = 1;
+            if (!duplicate && name_matches(di.name, names, name_count)) {
+                if (set->count == MAX_DEVICES) {
+                    fprintf(stderr, "Too many devices; maximum is %d.\n", MAX_DEVICES);
+                    if (!retained) device_close(d, rxbuf);
+                    free(cands); set->mgr = mgr; devices_release(set); return 0;
+                }
+                int n = set->count++;
+                set->devs[n] = d; set->info[n] = di; set->rxbufs[n] = rxbuf;
+                retained = 1;
+                if (!want_all && di.rank < 10) { preferred = 1; break; }
+            }
+            if (di.dev_idx == 0xFF) break;
         }
-
-        int duplicate = 0;
-        for (int k = 0; k < set->count && matched; k++) {
-            if (set->info[k].dev_idx == m_dev_idx &&
-                strcasecmp(set->info[k].name, cands[i].name) == 0)
-                duplicate = 1;
-        }
-
-        if (!matched || duplicate) {
-            IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
-                                             kCFRunLoopDefaultMode);
-            IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
-            continue;
-        }
-
-        if (set->count >= MAX_DEVICES) {
-            IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
-                                             kCFRunLoopDefaultMode);
-            IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
-            continue;
-        }
-
-        int n = set->count++;
-        set->devs[n] = d;
-        set->info[n].dev_idx = m_dev_idx;
-        set->info[n].report_id = m_report_id;
-        set->info[n].feature_idx = m_feature_idx;
-        snprintf(set->info[n].name, sizeof(set->info[n].name), "%s", cands[i].name);
+        if (!retained) device_close(d, rxbuf);
+        if (preferred) break;
     }
-
     free(cands);
-    if (set->count == 0) CFRelease(mgr);
-    else set->mgr = mgr;
+    devices_sort(set);
+    if (!want_all && set->count > 1) {
+        for (int i = 1; i < set->count; i++) {
+            int shared = 0;
+            for (int k = 0; k < i; k++) if (set->devs[k] == set->devs[i]) shared = 1;
+            if (!shared) device_close(set->devs[i], set->rxbufs[i]);
+        }
+        set->count = 1;
+    }
+    if (!set->count) CFRelease(mgr); else set->mgr = mgr;
     return set->count;
 }
 
@@ -404,6 +462,7 @@ typedef struct {
     int channel_a, channel_b;     /* 0 means "not set / invalid" */
     char device[16];
     char name[256];               /* comma-separated --name substrings */
+    char error[256];
 } config_t;
 
 static const char *default_config_path(char *buf, size_t n) {
@@ -427,17 +486,28 @@ static int config_int(const char *s) {
 }
 
 static void config_load(config_t *cfg, const char *path) {
+    memset(cfg, 0, sizeof(*cfg));
     cfg->channel_a = 1;
     cfg->channel_b = 2;
     snprintf(cfg->device, sizeof(cfg->device), "primary");
     cfg->name[0] = '\0';
     char def[PATH_MAX];
+    int explicit_path = path != NULL;
     if (!path) path = default_config_path(def, sizeof(def));
     if (!path) return;
     FILE *f = fopen(path, "r");
-    if (!f) return;
+    if (!f) {
+        if (explicit_path || errno != ENOENT)
+            snprintf(cfg->error, sizeof(cfg->error), "cannot read config: %s", strerror(errno));
+        return;
+    }
     char line[256];
     while (fgets(line, sizeof(line), f)) {
+        if (!strchr(line, '\n') && !feof(f)) {
+            int ch; while ((ch = fgetc(f)) != EOF && ch != '\n') {}
+            snprintf(cfg->error, sizeof(cfg->error), "config line exceeds 255 bytes");
+            continue;
+        }
         char *hash = strchr(line, '#');
         if (hash) *hash = '\0';
         char *s = line;
@@ -453,24 +523,28 @@ static void config_load(config_t *cfg, const char *path) {
         *eq = '\0';
         char *kend = s + strlen(s);
         while (kend > s && isspace((unsigned char)kend[-1])) *--kend = '\0';
+        for (char *k = s; *k; k++) *k = (char)tolower((unsigned char)*k);
         char *value = eq + 1;
         while (*value && isspace((unsigned char)*value)) value++;
 
         if (strcmp(s, "channel_a") == 0) {
-            cfg->channel_a = config_int(value);   /* 0 if junk; validated below */
+            cfg->channel_a = strlen(value) == 1 ? config_int(value) : 0;   /* 0 if junk; validated below */
         } else if (strcmp(s, "channel_b") == 0) {
-            cfg->channel_b = config_int(value);
+            cfg->channel_b = strlen(value) == 1 ? config_int(value) : 0;
         } else if (strcmp(s, "device") == 0) {
+            for (char *v = value; *v; v++) *v = (char)tolower((unsigned char)*v);
             snprintf(cfg->device, sizeof(cfg->device), "%s", value);
         } else if (strcmp(s, "name") == 0) {
             snprintf(cfg->name, sizeof(cfg->name), "%s", value);
         }
     }
+    if (ferror(f)) snprintf(cfg->error, sizeof(cfg->error), "error reading config");
     fclose(f);
 }
 
-/* Returns the first problem, or NULL if the config is usable for --toggle. */
+/* Returns the first problem, or NULL if the config is usable. */
 static const char *config_problem(const config_t *cfg) {
+    if (cfg->error[0]) return cfg->error;
     if (cfg->channel_a < 1 || cfg->channel_a > 3 ||
         cfg->channel_b < 1 || cfg->channel_b > 3)
         return "channel_a and channel_b must be 1, 2 or 3";
@@ -527,20 +601,27 @@ static void gather_status(IOHIDDeviceRef dev, const device_info_t *di,
     for (int i = 0; i < 2 && !st->has_battery; i++) {
         uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, bids[i]);
         if (!idx) continue;
-        if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, 0,
-                        NULL, 0, reply, &rlen, 0.3) || rlen < 6)
-            continue;
+        uint8_t function = bids[i] == FEAT_BATTERY_UNIFIED ? 1 : 0;
+        if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, function, NULL, 0,
+                        reply, &rlen, 0.3) || rlen < 7 || !reply[4] || reply[4] > 100) continue;
         st->has_battery = 1;
         st->battery = reply[4];
-        st->charging = reply[5] & 0x01;
+        st->charging = reply[6] == 1 || reply[6] == 2;
     }
-
-    uint8_t fw_idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_FW);
-    if (fw_idx &&
-        hidpp_call(dev, di->report_id, di->dev_idx, fw_idx, 0, NULL, 0,
-                   reply, &rlen, 0.3) &&
-        rlen >= 8 && reply[4] > 0 && (reply[6] || reply[7]))
-        snprintf(st->firmware, sizeof(st->firmware), "%d.%d", reply[6], reply[7]);
+    uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_FW);
+    if (!idx || !hidpp_call(dev, di->report_id, di->dev_idx, idx, 0, NULL, 0,
+                            reply, &rlen, 0.3) || rlen < 5) return;
+    uint8_t count = reply[4];
+    for (uint16_t entity = 0; entity < count; entity++) {
+        uint8_t parameter = (uint8_t)entity;
+        if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, 1, &parameter, 1,
+                        reply, &rlen, 0.3) || rlen < 12 || (reply[4] & 15)) continue;
+        unsigned build = ((unsigned)reply[10] << 8) | reply[11];
+        snprintf(st->firmware, sizeof(st->firmware), "%02X.%02X", reply[8], reply[9]);
+        if (build) snprintf(st->firmware + strlen(st->firmware),
+                            sizeof(st->firmware) - strlen(st->firmware), ".B%04X", build);
+        break;
+    }
 }
 
 static void print_human(const device_info_t *di, const status_t *st) {
@@ -730,7 +811,11 @@ int main(int argc, char **argv) {
     opts_t o = { 0 };
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
-        if (!strcmp(a, "1") || !strcmp(a, "2") || !strcmp(a, "3")) o.channel = atoi(a);
+        if (!strcmp(a, "1") || !strcmp(a, "2") || !strcmp(a, "3")) {
+            if (o.channel) { usage(argv[0]); return 2; }
+            o.channel = atoi(a);
+        }
+        else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { usage(argv[0]); return 0; }
         else if (!strcmp(a, "--info")) { o.mode = "info"; o.mode_count++; }
         else if (!strcmp(a, "--status")) { o.mode = "status"; o.mode_count++; }
         else if (!strcmp(a, "--toggle")) { o.mode = "toggle"; o.mode_count++; }
@@ -742,13 +827,14 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
         else if (!strcmp(a, "--config") && i + 1 < argc) o.config_path = argv[++i];
         else if (!strcmp(a, "--name") && i + 1 < argc) {
+            if (!argv[i+1][0]) { fprintf(stderr, "--name requires a nonempty substring\n"); return 2; }
             if (o.name_count < MAX_NAME_FILTERS) o.names[o.name_count++] = argv[++i];
-            else i++;
+            else { fprintf(stderr, "Too many --name filters (maximum 16).\n"); return 2; }
         }
         else { usage(argv[0]); return 2; }
     }
 
-    if (o.mode_count > 1) {
+    if (o.mode_count + (o.channel != 0) > 1) {
         fprintf(stderr, "--info, --status, --toggle, --list and --setup are "
                         "mutually exclusive\n");
         return 2;
@@ -762,13 +848,14 @@ int main(int argc, char **argv) {
     config_load(&cfg, o.config_path);
     if (o.all || strcmp(cfg.device, "all") == 0) o.all = 1;
 
-    if (o.mode && !strcmp(o.mode, "toggle")) {
+    {
         const char *problem = config_problem(&cfg);
         if (problem) {
-            fprintf(stderr, "Cannot toggle: %s\n", problem);
+            fprintf(stderr, "Invalid config %s: %s\n", o.config_path ? o.config_path : "(default)", problem);
             return 2;
         }
-    } else if (!o.mode && o.channel == 0) {
+    }
+    if (!o.mode && o.channel == 0) {
         usage(argv[0]);
         return 2;
     }
@@ -788,12 +875,17 @@ int main(int argc, char **argv) {
     if (cfg.name[0]) {
         char *save = NULL;
         for (char *tok = strtok_r(cfg.name, ",", &save);
-             tok && name_count < MAX_NAME_FILTERS;
+             tok;
              tok = strtok_r(NULL, ",", &save)) {
             while (*tok == ' ' || *tok == '\t') tok++;
             char *e = tok + strlen(tok);
             while (e > tok && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
-            if (*tok) names[name_count++] = tok;
+            if (*tok) {
+                if (name_count == MAX_NAME_FILTERS) {
+                    fprintf(stderr, "Too many name filters (maximum 16).\n"); return 2;
+                }
+                names[name_count++] = tok;
+            }
         }
     }
 

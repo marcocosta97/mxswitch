@@ -1,7 +1,10 @@
 {
-  "_comment": "Canonical HID++ frame encodings and reply classifications shared by every implementation's test suite. Hex is the full report, report id included, zero-padded to the report length.",
+  "_comment": "HID++ request/reply cases consumed by all four test suites. Reports include the report ID and padding.",
   "software_id": 10,
-  "frame_lengths": { "16": 7, "17": 20 },
+  "frame_lengths": {
+    "16": 7,
+    "17": 20
+  },
   "frames": [
     {
       "name": "root getFeature 0x1814, long",
@@ -9,7 +12,11 @@
       "device_index": 255,
       "feature_index": 0,
       "function": 0,
-      "params": [24, 20, 0],
+      "params": [
+        24,
+        20,
+        0
+      ],
       "hex": "11ff000a18140000000000000000000000000000"
     },
     {
@@ -18,7 +25,11 @@
       "device_index": 255,
       "feature_index": 0,
       "function": 0,
-      "params": [24, 20, 0],
+      "params": [
+        24,
+        20,
+        0
+      ],
       "hex": "10ff000a181400"
     },
     {
@@ -45,7 +56,9 @@
       "device_index": 255,
       "feature_index": 10,
       "function": 1,
-      "params": [1],
+      "params": [
+        1
+      ],
       "hex": "11ff0a1a01000000000000000000000000000000"
     },
     {
@@ -54,7 +67,9 @@
       "device_index": 255,
       "feature_index": 10,
       "function": 1,
-      "params": [1],
+      "params": [
+        1
+      ],
       "hex": "10ff0a1a010000"
     },
     {
@@ -63,7 +78,9 @@
       "device_index": 2,
       "feature_index": 10,
       "function": 1,
-      "params": [0],
+      "params": [
+        0
+      ],
       "hex": "11020a1a00000000000000000000000000000000"
     },
     {
@@ -92,8 +109,8 @@
       "outcome": "match"
     },
     {
-      "name": "battery reply, 88% and charging",
-      "hex": "11ff050a58010000000000000000000000000000",
+      "name": "battery reply, 88%, next level 80%, charging",
+      "hex": "11ff050a58500100000000000000000000000000",
       "device_index": 255,
       "feature_index": 5,
       "outcome": "match"
@@ -121,14 +138,14 @@
     },
     {
       "name": "HID++ 2.0 error reply",
-      "hex": "11ffff0a00000000000000000000000000000000",
+      "hex": "11ffff0a0a010000000000000000000000000000",
       "device_index": 255,
       "feature_index": 10,
       "outcome": "error"
     },
     {
       "name": "HID++ 1.0 error reply",
-      "hex": "11ff8f0a00000000000000000000000000000000",
+      "hex": "10ff8f0a0a0100",
       "device_index": 255,
       "feature_index": 10,
       "outcome": "error"
@@ -136,6 +153,49 @@
     {
       "name": "reply shorter than a HID++ header",
       "hex": "11ff0a",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "too_short"
+    },
+    {
+      "name": "different function ignored",
+      "hex": "11ff0a1a03010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "ignore"
+    },
+    {
+      "name": "matching function 1",
+      "hex": "11ff0a1a03010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "function": 1,
+      "outcome": "match"
+    },
+    {
+      "name": "error from other software ignored",
+      "hex": "11ffff0a0b010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "ignore"
+    },
+    {
+      "name": "error for other feature ignored",
+      "hex": "11ffff050a010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "ignore"
+    },
+    {
+      "name": "Bluetooth zero device index",
+      "hex": "11000a0a03010000000000000000000000000000",
+      "device_index": 255,
+      "feature_index": 10,
+      "outcome": "match"
+    },
+    {
+      "name": "truncated long report",
+      "hex": "11ff0a0a0301",
       "device_index": 255,
       "feature_index": 10,
       "outcome": "too_short"
