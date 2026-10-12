@@ -145,16 +145,67 @@ if sys.platform == "win32":
                     ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
                     ("hEvent", wintypes.HANDLE)]
 
-    # Setting restype matters: the default c_int silently truncates 64-bit handles.
+    # Prototypes for every call that takes or returns a handle. Without
+    # argtypes, ctypes converts a bare Python int to C int, truncating a
+    # 64-bit handle (and raising OverflowError on Windows once it exceeds
+    # 2**31) - exactly the hazard the restype-only version missed.
     setupapi.SetupDiGetClassDevsW.restype = wintypes.HANDLE
     setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.POINTER(GUID), wintypes.LPCWSTR,
                                               wintypes.HWND, wintypes.DWORD]
+    setupapi.SetupDiEnumDeviceInterfaces.restype = wintypes.BOOL
+    setupapi.SetupDiEnumDeviceInterfaces.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(GUID),
+        wintypes.DWORD, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA)]
+    setupapi.SetupDiGetDeviceInterfaceDetailW.restype = wintypes.BOOL
+    setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(SP_DEVICE_INTERFACE_DATA),
+        ctypes.POINTER(SP_DEVICE_INTERFACE_DETAIL_DATA_W), wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    setupapi.SetupDiDestroyDeviceInfoList.restype = wintypes.BOOL
+    setupapi.SetupDiDestroyDeviceInfoList.argtypes = [wintypes.HANDLE]
+
+    hid_dll.HidD_GetHidGuid.restype = None
+    hid_dll.HidD_GetHidGuid.argtypes = [ctypes.POINTER(GUID)]
+    hid_dll.HidD_GetAttributes.restype = wintypes.BOOL
+    hid_dll.HidD_GetAttributes.argtypes = [wintypes.HANDLE,
+                                           ctypes.POINTER(HIDD_ATTRIBUTES)]
+    hid_dll.HidD_GetPreparsedData.restype = wintypes.BOOL
+    hid_dll.HidD_GetPreparsedData.argtypes = [wintypes.HANDLE,
+                                              ctypes.POINTER(ctypes.c_void_p)]
+    hid_dll.HidD_FreePreparsedData.restype = wintypes.BOOL
+    hid_dll.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
+    hid_dll.HidD_GetProductString.restype = wintypes.BOOL
+    hid_dll.HidD_GetProductString.argtypes = [wintypes.HANDLE,
+                                              ctypes.POINTER(ctypes.c_wchar),
+                                              wintypes.ULONG]
+    hid_dll.HidP_GetCaps.restype = wintypes.LONG
+    hid_dll.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
+
     kernel32.CreateFileW.restype = wintypes.HANDLE
     kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
                                      ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
                                      wintypes.HANDLE]
     kernel32.CreateEventW.restype = wintypes.HANDLE
-    hid_dll.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.POINTER(HIDP_CAPS)]
+    kernel32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL,
+                                      wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.CancelIo.restype = wintypes.BOOL
+    kernel32.CancelIo.argtypes = [wintypes.HANDLE]
+    kernel32.GetOverlappedResult.restype = wintypes.BOOL
+    kernel32.GetOverlappedResult.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(OVERLAPPED),
+        ctypes.POINTER(wintypes.DWORD), wintypes.BOOL]
+    kernel32.ResetEvent.restype = wintypes.BOOL
+    kernel32.ResetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(ctypes.c_char), wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(OVERLAPPED)]
+    kernel32.ReadFile.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = kernel32.WriteFile.argtypes
 
     def _query(path):
         """Open briefly, read VID/usage/report lengths, close. None if unusable."""
@@ -237,6 +288,9 @@ if sys.platform == "win32":
             if self.h == INVALID_HANDLE_VALUE:
                 raise OSError(ctypes.get_last_error(), "CreateFileW failed")
             self.event = kernel32.CreateEventW(None, True, False, None)
+            if not self.event:
+                kernel32.CloseHandle(self.h)
+                raise OSError(ctypes.get_last_error(), "CreateEventW failed")
 
         def _wait(self, ov, timeout_ms):
             transferred = wintypes.DWORD()
@@ -318,8 +372,12 @@ else:
         def __init__(self, info):
             self.out_len = 0                 # hidapi sizes the frame itself
             self.dev = _hid().device()
-            self.dev.open_path(info["path"])
-            self.dev.set_nonblocking(0)
+            try:
+                self.dev.open_path(info["path"])
+                self.dev.set_nonblocking(0)
+            except Exception:
+                self.dev.close()
+                raise
 
         def write(self, data):
             self.dev.write(bytes(data))
@@ -406,7 +464,9 @@ iter_devices.seen = set()
 
 def host_info(dev, dev_idx, report_id, feat_idx):
     reply = request(dev, report_id, dev_idx, feat_idx, 0)
-    return (reply[4], reply[5]) if reply else None
+    if reply and len(reply) >= 6:
+        return (reply[4], reply[5])
+    return None
 
 
 def battery_status(dev, dev_idx, report_id):
@@ -542,7 +602,7 @@ def main():
     ap = _Parser(description=__doc__,
                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("channel", nargs="?", type=int,
-                    help=f"target channel, 1-based (default: {DEFAULT_CONFIG['channel_b']} when omitted)")
+                    help="target channel, 1-based")
     ap.add_argument("--info", action="store_true", help="show host info and exit")
     ap.add_argument("--status", action="store_true",
                     help="show host info plus battery and firmware")
@@ -582,7 +642,7 @@ def main():
             ap.error("channel must be 1, 2 or 3")
 
     if args.verbose:
-        print(f"config     : {config_path()}", file=sys.stderr)
+        print(f"config     : {args.config or config_path()}", file=sys.stderr)
 
     iter_devices.seen.clear()
     devices = list(iter_devices(want_all))
@@ -594,9 +654,14 @@ def main():
 
     try:
         if args.info or args.status:
-            reports = [describe_device(*d, status=args.status) for d in devices]
+            try:
+                reports = [describe_device(*d, status=args.status) for d in devices]
+            except OSError as exc:
+                sys.stderr.write(f"Could not read device status: {exc}\n")
+                return 1
             if args.json:
-                print(json.dumps(reports[0] if not want_all else reports, indent=2))
+                # Always an array, matching the macOS/Linux/PowerShell ports.
+                print(json.dumps(reports, indent=2))
             else:
                 for i, report in enumerate(reports):
                     if i:
@@ -606,7 +671,11 @@ def main():
 
         if args.toggle:
             primary = devices[0]
-            hosts = host_info(primary[0], primary[1], primary[2], primary[3])
+            try:
+                hosts = host_info(primary[0], primary[1], primary[2], primary[3])
+            except OSError as exc:
+                sys.stderr.write(f"Could not read the current channel ({exc}).\n")
+                return 1
             if not hosts:
                 sys.stderr.write("Could not read the current channel.\n")
                 return 1

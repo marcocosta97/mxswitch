@@ -28,7 +28,8 @@ def load_module():
 
 
 mx = load_module()
-FIXTURES = json.load(open(os.path.join(ROOT, "tests", "fixtures", "frames.json")))
+with open(os.path.join(ROOT, "tests", "fixtures", "frames.json")) as _fh:
+    FIXTURES = json.load(_fh)
 
 
 class FakeDevice:
@@ -211,6 +212,14 @@ class CliTests(unittest.TestCase):
         self.install([fake_entry()])
         code, _, _ = self.run_main([])
         self.assertEqual(code, 2)
+
+    def test_json_is_always_an_array(self):
+        # Every port emits a JSON array, including the single-device case.
+        self.install([fake_entry()])
+        code, out, _ = self.run_main(["--info", "--json"])
+        self.assertEqual(code, 0)
+        self.assertTrue(out.lstrip().startswith("["))
+        self.assertIn('"product"', out)
 
 
 if __name__ == "__main__":
