@@ -49,4 +49,4 @@ jobs:
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Pester -Force -Scope CurrentUser -SkipPublisherCheck
-          Invoke-Pester -Path tests/test_powershell.ps1
+          Invoke-Pester -Path tests/test_powershell.ps1 -CI
