@@ -86,6 +86,18 @@ Describe 'Test-MxName' {
     }
 }
 
+Describe 'Resolve-MxProduct' {
+    It 'keeps a real product string' {
+        (Resolve-MxProduct 'MX Keys S' 0x1234) | Should -Be 'MX Keys S'
+    }
+    It 'names POP Icon Keys when the string is empty' {
+        (Resolve-MxProduct '' 0xB38F) | Should -Be 'POP Icon Keys'
+    }
+    It 'leaves other unnamed devices empty' {
+        (Resolve-MxProduct '' 0x1234) | Should -Be ''
+    }
+}
+
 Describe 'Get-MxConfig' {
     It 'returns defaults when the file is missing' {
         $cfg = Get-MxConfig -Path (Join-Path $env:TEMP 'mxswitch-does-not-exist')

@@ -131,6 +131,17 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(mx.validate_config(bad))
 
 
+class ProductNameTests(unittest.TestCase):
+    def test_keeps_a_real_product_string(self):
+        self.assertEqual(mx.product_name("MX Keys S", 0x1234), "MX Keys S")
+
+    def test_pop_icon_keys_fallback(self):
+        self.assertEqual(mx.product_name("", mx.POP_ICON_KEYS_BT_PID), "POP Icon Keys")
+
+    def test_other_unnamed_device_stays_empty(self):
+        self.assertEqual(mx.product_name("", 0x1234), "")
+
+
 class NameFilterTests(unittest.TestCase):
     def test_no_filter_matches_everything(self):
         self.assertTrue(mx.name_matches(fake_entry()[4], None))

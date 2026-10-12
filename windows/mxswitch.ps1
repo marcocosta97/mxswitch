@@ -366,6 +366,15 @@ function Test-MxName {
     return $false
 }
 
+# Over Bluetooth some devices (POP Icon Keys) report an empty HID product
+# string on Windows; fill in the known name so ranking and -Name still work.
+function Resolve-MxProduct {
+    param([string]$Product, [int]$Pid)
+    if ($Product) { return $Product }
+    if ($Pid -eq 0xB38F) { return 'POP Icon Keys' }
+    return ''
+}
+
 <#
     Discovery costs a round trip per candidate collection and device index, so
     the resolved answer is cached. This is purely a latency win: a cached path
@@ -461,6 +470,7 @@ function Find-MxDevices {
     }
 
     $ifaces = [Hid]::Enumerate($VID) |
+        ForEach-Object { $_.Product = Resolve-MxProduct $_.Product $_.Pid; $_ } |
         Where-Object { Test-MxName $_.Product $Names } |
         Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product }
 

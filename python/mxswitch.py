@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 
 LOGITECH_VID = 0x046D
+POP_ICON_KEYS_BT_PID = 0xB38F  # Windows may omit its HID product string over BT
 SW_ID = 0x0A                  # software id, any value 1..15
 ROOT_FEATURE = 0x00
 FEAT_CHANGE_HOST = 0x1814
@@ -87,6 +88,13 @@ def device_rank(usage_page, usage, name):
     tier = 2 if (kbd and not mouse) else (0 if mouse else 1)
     non_vendor = 0 if usage_page >= 0xFF00 else 1
     return tier * 10 + non_vendor
+
+
+def product_name(name, product_id):
+    """Windows Bluetooth may omit the HID product string for POP Icon Keys."""
+    if name:
+        return name
+    return "POP Icon Keys" if product_id == POP_ICON_KEYS_BT_PID else ""
 
 
 def name_matches(info, names):
@@ -248,7 +256,8 @@ if sys.platform == "win32":
             name = ctypes.create_unicode_buffer(128)
             hid_dll.HidD_GetProductString(h, name, ctypes.sizeof(name))
             return {"path": path, "usage_page": caps.UsagePage, "usage": caps.Usage,
-                    "product_id": attrs.ProductID, "product_string": name.value,
+                    "product_id": attrs.ProductID,
+                    "product_string": product_name(name.value, attrs.ProductID),
                     "in_len": caps.InputReportByteLength,
                     "out_len": caps.OutputReportByteLength}
         finally:
