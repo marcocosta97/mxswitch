@@ -77,14 +77,15 @@ receiver, which stays live whenever the machine is powered.
 mxswitch 2          # switch to channel 2
 mxswitch --info     # device, transport, feature index, current channel
 mxswitch --all 2    # switch every ChangeHost device, not just the preferred one
-mxswitch --name Keys  # only devices whose product name contains "Keys"
+mxswitch --name Keys 2  # switch matching keyboards to channel 2
 mxswitch --toggle   # switch to the other channel in the configured pair
 ```
 
 `--name` (repeatable) keeps only devices whose product name contains one of the
 given substrings; with `--all` it moves exactly the matched devices, e.g. a
 keyboard and mouse while leaving a third device alone. The config `name=` list
-is combined with it.
+is combined with it. Devices behind a receiver are matched by their HID++ names;
+unnamed receiver slots cannot match a name filter.
 
 PowerShell spells the long options `-Info`, `-All`, `-Toggle`. `--toggle` reads
 the current channel and moves to the other one of a pair you configure, so the
@@ -97,7 +98,18 @@ channel_a=1
 channel_b=2
 ```
 
-Exit codes are `0` success, `1` no device found and `2` bad usage.
+`--toggle --all` reads the preferred matching device and moves all matches to
+the same target channel.
+
+See `config.example` for device/name filters. Invalid config values are errors;
+`--config PATH` must exist. `--status` adds battery/firmware, `--dry-run` previews
+commands, and `--verbose` shows diagnostics. PowerShell uses `-Name`, `-Config`,
+`-Status`, `-DryRun` and `-Verbose`.
+
+Exit codes: `0` success, `1` no compatible device or operation failed,
+`2` bad usage/configuration, `3` partial failure across multiple devices.
+
+“Command sent” confirms the request was written, not connection to the target host.
 
 ## Install
 
@@ -200,8 +212,8 @@ better, use it:
 
 - [marcelhoffs/input-switcher](https://github.com/marcelhoffs/input-switcher) —
   Windows/Linux scripts around a vendored `hidapitester`; switches a keyboard and
-  mouse together, which `mxswitch` does not — it prefers the mouse when both are
-  present (use Options+ / Flow to move a pair).
+  mouse together. `mxswitch --all` can also move both; its default is to move
+  the preferred device, usually the mouse.
 - [meliksah/lcs](https://github.com/meliksah/lcs) — GUI channel switcher.
 - [omar16100/logi_mx_auto_switch](https://github.com/omar16100/logi_mx_auto_switch) —
   makes a mouse follow its keyboard automatically on macOS.
