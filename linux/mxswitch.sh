@@ -18,9 +18,9 @@
 # Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 partial --all failure.
 #
 # hidraw nodes are root-only by default. One-time fix, as root:
-#   echo 'KERNEL=="hidraw*", ATTRS{idVendor}=="046d", MODE="0660", TAG+="uaccess"' \
-#     > /etc/udev/rules.d/42-logitech-hidpp.rules
-#   udevadm control --reload-rules && udevadm trigger
+#   sudo cp linux/42-logitech-hidpp.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# The rule covers USB/Bolt receivers and Bluetooth-connected devices.
 
 set -uo pipefail
 
@@ -28,7 +28,7 @@ SW_ID=10                 # software id, any value 1..15
 FEAT_CHANGE_HOST_HI=0x18
 FEAT_CHANGE_HOST_LO=0x14
 FEAT_DEVICE_FW=0x0003
-DEVICE_INDICES=(0xff 1 2 3 4 5 6)
+DEVICE_INDICES=(255 1 2 3 4 5 6)
 REPORT_IDS=(0x11 0x10)   # long, short
 READ_TIMEOUT=0.2
 
@@ -62,7 +62,8 @@ hidpp_build_frame() {
 hidpp_classify_reply() {
     local reply=$1 didx=$2 fidx=$3
     [ "${#reply}" -ge 10 ] || { printf 'too_short'; return 0; }
-    [ "$(( 0x$(byte "$reply" 1) ))" -eq "$didx" ] || { printf 'ignore'; return 0; }
+    # Compare numerically: callers may pass the device index in hex.
+    [ "$(( 0x$(byte "$reply" 1) ))" -eq "$(( didx ))" ] || { printf 'ignore'; return 0; }
     local rf=$(( 0x$(byte "$reply" 2) ))
     # 0xff / 0x8f are HID++ 2.0 / 1.0 error replies
     if [ "$rf" -eq 255 ] || [ "$rf" -eq 143 ]; then printf 'error'; return 0; fi
@@ -162,7 +163,7 @@ find_device() {
     local seen=" " node rid didx reply fidx name fd matched key
     for node in $(logitech_hidraws); do
         name=$(hidraw_name "$node")
-        exec {fd}<>"$node" 2>/dev/null || continue
+        { exec {fd}<>"$node"; } 2>/dev/null || continue
         matched=0
         for didx in "${DEVICE_INDICES[@]}"; do
             for rid in "${REPORT_IDS[@]}"; do
@@ -282,7 +283,8 @@ main() {
             --dry-run) dry=1 ;;
             --json)    json=1 ;;
             --verbose) verbose=1 ;;
-            --config)  shift; config=${1:-} ;;
+            --config)  shift; config=${1:-}
+                       [ -n "$config" ] || { usage; exit 2; } ;;
             -h|--help) usage; exit 0 ;;
             1|2|3)     channel=$1 ;;
             *) usage; exit 2 ;;
@@ -327,7 +329,7 @@ main() {
         [ "$json" -eq 1 ] && printf '['
         for (( i=0; i<n; i++ )); do
             local transport hosts battery="" charging="" fw=""
-            transport="receiver"; [ "${DEV_DIDX[$i]}" -eq 255 ] \
+            transport="receiver"; [ "$(( DEV_DIDX[i] ))" -eq 255 ] \
                 && transport="direct (BT/USB)"
             if [ "$mode" = "status" ]; then
                 local battery_pair=""
@@ -373,6 +375,10 @@ main() {
             [ -n "$fw" ] && echo "firmware   : $fw"
         done
         [ "$json" -eq 1 ] && printf ']\n'
+        for (( i=0; i<n; i++ )); do
+            local f=${DEV_FDS[$i]}
+            exec {f}>&- 2>/dev/null || true
+        done
         exit 0
     fi
 

@@ -62,6 +62,8 @@ check "notification ignored" "ignore" \
     "$(hidpp_classify_reply 11ff050a00000000000000000000000000000000 255 10)"
 check "other device ignored" "ignore" \
     "$(hidpp_classify_reply 11010a0a03010000000000000000000000000000 255 10)"
+check "hex device index matches" "match" \
+    "$(hidpp_classify_reply 11ff0a0a03010000000000000000000000000000 0xff 10)"
 check "other sw id ignored" "ignore" \
     "$(hidpp_classify_reply 11ff0a1b03010000000000000000000000000000 255 10)"
 check "HID++ 2.0 error" "error" \
