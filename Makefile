@@ -4,7 +4,11 @@
 #                    make install PREFIX=$HOME/.local
 # System-wide:       sudo make install
 
-CC      ?= clang
+# `CC ?= clang` would be a no-op: GNU make predefines CC=cc. Only override the
+# built-in default, so a user- or command-line-provided CC still wins.
+ifeq ($(origin CC),default)
+CC := clang
+endif
 CFLAGS  ?= -O2 -Wall -Wextra
 PREFIX  ?= /usr/local
 FRAMEWORKS = -framework IOKit -framework CoreFoundation -framework CoreGraphics
