@@ -214,6 +214,15 @@ static int name_has(const char *name, const char *needle) {
     return name && strcasestr(name, needle) != NULL;
 }
 
+/* No filter set, or the product name contains any of the substrings. */
+static int name_matches(const char *name, const char *const *subs, int n) {
+    if (!n) return 1;
+    for (int i = 0; i < n; i++) {
+        if (subs[i][0] && name_has(name, subs[i])) return 1;
+    }
+    return 0;
+}
+
 static int device_rank(int32_t usage_page, int32_t usage, const char *name) {
     int mouse = (usage_page == 0x0001 && usage == 0x0002)
                 || name_has(name, "master") || name_has(name, "anywhere")
@@ -239,9 +248,11 @@ static int cand_cmp(const void *a, const void *b) {
 /*
  * Discover ChangeHost-capable devices. With want_all set, every unique device
  * (deduped by name + device index) is collected; otherwise the first ranked
- * one. Returns the number of devices in *set.
+ * one. When names are given, only devices whose product name contains one of
+ * them are considered. Returns the number of devices in *set.
  */
-static int find_devices(device_set_t *set, int want_all, int verbose) {
+static int find_devices(device_set_t *set, int want_all, int verbose,
+                        const char *const *names, int name_count) {
     memset(set, 0, sizeof(*set));
 
     IOHIDManagerRef mgr = IOHIDManagerCreate(kCFAllocatorDefault,
@@ -272,6 +283,8 @@ static int find_devices(device_set_t *set, int want_all, int verbose) {
         CFStringRef p = IOHIDDeviceGetProperty(d, CFSTR(kIOHIDProductKey));
         if (p && CFGetTypeID(p) == CFStringGetTypeID())
             CFStringGetCString(p, name, sizeof(name), kCFStringEncodingUTF8);
+
+        if (!name_matches(name, names, name_count)) continue;
 
         cands[ncand].dev = d;
         cands[ncand].usage_page = usage_page;
@@ -390,6 +403,7 @@ static void list_devices(void) {
 typedef struct {
     int channel_a, channel_b;     /* 0 means "not set / invalid" */
     char device[16];
+    char name[256];               /* comma-separated --name substrings */
 } config_t;
 
 static const char *default_config_path(char *buf, size_t n) {
@@ -416,6 +430,7 @@ static void config_load(config_t *cfg, const char *path) {
     cfg->channel_a = 1;
     cfg->channel_b = 2;
     snprintf(cfg->device, sizeof(cfg->device), "primary");
+    cfg->name[0] = '\0';
     char def[PATH_MAX];
     if (!path) path = default_config_path(def, sizeof(def));
     if (!path) return;
@@ -447,6 +462,8 @@ static void config_load(config_t *cfg, const char *path) {
             cfg->channel_b = config_int(value);
         } else if (strcmp(s, "device") == 0) {
             snprintf(cfg->device, sizeof(cfg->device), "%s", value);
+        } else if (strcmp(s, "name") == 0) {
+            snprintf(cfg->name, sizeof(cfg->name), "%s", value);
         }
     }
     fclose(f);
@@ -688,18 +705,23 @@ static int setup_input_monitoring(void) {
 
 /* ------------------------------------------------------------------ */
 
+#define MAX_NAME_FILTERS 16
+
 typedef struct {
     const char *mode;             /* info status list toggle setup, or NULL */
     int mode_count;               /* how many mode flags were given */
     int channel;                  /* 0 = unset */
     int all, dry, json, verbose;
     const char *config_path;
+    const char *names[MAX_NAME_FILTERS];  /* --name substrings, OR'd */
+    int name_count;
 } opts_t;
 
 static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s {1|2|3|--info|--status|--toggle|--list|--setup} "
-            "[--all] [--dry-run] [--json] [--verbose] [--config PATH]\n", prog);
+            "[--all] [--name SUBSTR] [--dry-run] [--json] [--verbose] "
+            "[--config PATH]\n", prog);
 }
 
 #ifndef MXSWITCH_TEST
@@ -719,6 +741,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--json")) o.json = 1;
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
         else if (!strcmp(a, "--config") && i + 1 < argc) o.config_path = argv[++i];
+        else if (!strcmp(a, "--name") && i + 1 < argc) {
+            if (o.name_count < MAX_NAME_FILTERS) o.names[o.name_count++] = argv[++i];
+            else i++;
+        }
         else { usage(argv[0]); return 2; }
     }
 
@@ -754,8 +780,25 @@ int main(int argc, char **argv) {
         fprintf(stderr, "config     : %s\n", path ? path : "(none)");
     }
 
+    /* Union of --name filters and the config `name` list, comma-separated. */
+    const char *names[MAX_NAME_FILTERS];
+    int name_count = 0;
+    for (int i = 0; i < o.name_count && name_count < MAX_NAME_FILTERS; i++)
+        names[name_count++] = o.names[i];
+    if (cfg.name[0]) {
+        char *save = NULL;
+        for (char *tok = strtok_r(cfg.name, ",", &save);
+             tok && name_count < MAX_NAME_FILTERS;
+             tok = strtok_r(NULL, ",", &save)) {
+            while (*tok == ' ' || *tok == '\t') tok++;
+            char *e = tok + strlen(tok);
+            while (e > tok && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
+            if (*tok) names[name_count++] = tok;
+        }
+    }
+
     device_set_t set;
-    int found = find_devices(&set, o.all, o.verbose);
+    int found = find_devices(&set, o.all, o.verbose, names, name_count);
     if (!found) {
         fprintf(stderr, "No Logitech device supporting ChangeHost found.\n");
         fprintf(stderr, "Click the mouse to wake it, and check Input Monitoring.\n");

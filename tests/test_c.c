@@ -58,7 +58,8 @@ static void check_config(void) {
     char path[] = "/tmp/mxswitch-test-XXXXXX";
     int fd = mkstemp(path);
     if (fd < 0) { printf("FAIL: mkstemp\n"); fails++; return; }
-    const char *text = "# comment\nchannel_a = 3\nchannel_b=1\ndevice = all\n";
+    const char *text = "# comment\nchannel_a = 3\nchannel_b=1\ndevice = all\n"
+                       "name = MX Keys, MX Master\n";
     if (write(fd, text, strlen(text)) != (ssize_t)strlen(text)) {
         printf("FAIL: config write\n"); fails++;
     }
@@ -72,11 +73,39 @@ static void check_config(void) {
                c.channel_a, c.channel_b, c.device);
         fails++;
     }
+    /* The name list keeps its internal spaces. */
+    if (strcmp(c.name, "MX Keys, MX Master") != 0) {
+        printf("FAIL: config name parse (name='%s')\n", c.name);
+        fails++;
+    }
     /* A missing file keeps the defaults. */
     config_load(&c, "/nonexistent/mxswitch/config");
-    if (c.channel_a != 1 || c.channel_b != 2 || strcmp(c.device, "primary") != 0) {
+    if (c.channel_a != 1 || c.channel_b != 2 ||
+        strcmp(c.device, "primary") != 0 || c.name[0] != '\0') {
         printf("FAIL: config defaults\n");
         fails++;
+    }
+}
+
+static void check_name(void) {
+    const char *only_keys[] = { "keys" };
+    const char *master[] = { "master" };
+    const char *either[] = { "nope", "master" };
+    const char *blank[] = { "" };
+    struct { const char *name; const char *const *subs; int n; int want; } cases[] = {
+        { "MX Master 3S", NULL, 0, 1 },          /* no filter matches all */
+        { NULL, only_keys, 1, 0 },
+        { "MX Keys S", only_keys, 1, 1 },        /* case-insensitive */
+        { "MX Keys S", master, 1, 0 },
+        { "MX Master 3S", either, 2, 1 },        /* any filter matches */
+        { "MX Keys S", blank, 1, 0 },            /* empty filter ignored */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (name_matches(cases[i].name, cases[i].subs, cases[i].n) != cases[i].want) {
+            printf("FAIL: name_matches(%s, n=%d)\n",
+                   cases[i].name ? cases[i].name : "(null)", cases[i].n);
+            fails++;
+        }
     }
 }
 
@@ -131,6 +160,7 @@ int main(void) {
     check_reply("too short", "11ff0a", 0xFF, 0x0A, REPLY_TOO_SHORT);
 
     check_config();
+    check_name();
 
     if (fails) {
         printf("\n%d test(s) failed\n", fails);

@@ -35,6 +35,7 @@ READ_TIMEOUT=0.2
 CONFIG_CHANNEL_A=1
 CONFIG_CHANNEL_B=2
 CONFIG_DEVICE=primary
+CONFIG_NAME=""
 
 byte() { printf '%s' "${1:$(( $2 * 2 )):2}"; }   # byte N of a hex string
 
@@ -71,6 +72,23 @@ hidpp_classify_reply() {
     [ "$(( 0x$(byte "$reply" 3) & 0x0f ))" -eq "$SW_ID" ] \
         || { printf 'ignore'; return 0; }
     printf 'match'
+}
+
+# name_matches <name> [<substr>...]
+# True (0) when no substring is given, or the name contains any of them,
+# case-insensitively. Empty substrings are ignored.
+name_matches() {
+    local name=$1; shift
+    [ "$#" -gt 0 ] || return 0
+    local lower f
+    lower=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
+    for f in "$@"; do
+        [ -n "$f" ] || continue
+        case "$lower" in
+            *"$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"*) return 0 ;;
+        esac
+    done
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -159,10 +177,12 @@ DEV_NODES=(); DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
 
 find_device() {
     local want_all=${1:-0}
+    [ "$#" -gt 0 ] && shift
     DEV_NODES=(); DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
     local seen=" " node rid didx reply fidx name fd matched key
     for node in $(logitech_hidraws); do
         name=$(hidraw_name "$node")
+        name_matches "$name" "$@" || continue
         { exec {fd}<>"$node"; } 2>/dev/null || continue
         matched=0
         for didx in "${DEVICE_INDICES[@]}"; do
@@ -236,15 +256,21 @@ config_file() {
 }
 
 config_load() {
-    local file=$1 line
+    local file=$1 line key value
     [ -r "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line%%#*}
-        line=${line//[[:space:]]/}
-        case "$line" in
-            channel_a=*) CONFIG_CHANNEL_A=${line#channel_a=} ;;
-            channel_b=*) CONFIG_CHANNEL_B=${line#channel_b=} ;;
-            device=*)    CONFIG_DEVICE=${line#device=} ;;
+        case "$line" in *=*) ;; *) continue ;; esac
+        key=${line%%=*}; key=${key//[[:space:]]/}
+        value=${line#*=}
+        # Trim only the ends: a name filter may contain internal spaces.
+        value="${value#"${value%%[![:space:]]*}"}"
+        value="${value%"${value##*[![:space:]]}"}"
+        case "$key" in
+            channel_a) CONFIG_CHANNEL_A=$value ;;
+            channel_b) CONFIG_CHANNEL_B=$value ;;
+            device)    CONFIG_DEVICE=$value ;;
+            name)      CONFIG_NAME=$value ;;
         esac
     done <"$file"
 }
@@ -268,11 +294,12 @@ json_escape() {
 # ---------------------------------------------------------------------------
 
 usage() {
-    echo "usage: $0 {1|2|3|--info|--status|--toggle|--list} [--all] [--dry-run] [--json] [--verbose] [--config PATH]" >&2
+    echo "usage: $0 {1|2|3|--info|--status|--toggle|--list} [--all] [--name SUBSTR] [--dry-run] [--json] [--verbose] [--config PATH]" >&2
 }
 
 main() {
     local mode="" channel="" want_all=0 dry=0 json=0 verbose=0 config=""
+    local -a want_name=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --info)    mode="info" ;;
@@ -280,6 +307,8 @@ main() {
             --toggle)  mode="toggle" ;;
             --list)    mode="list" ;;
             --all)     want_all=1 ;;
+            --name)    shift; want_name+=("${1:-}")
+                       [ -n "${1:-}" ] || { usage; exit 2; } ;;
             --dry-run) dry=1 ;;
             --json)    json=1 ;;
             --verbose) verbose=1 ;;
@@ -295,6 +324,16 @@ main() {
     config=${config:-$(config_file)}
     config_load "$config"
     [ "$CONFIG_DEVICE" = "all" ] && want_all=1
+
+    if [ -n "$CONFIG_NAME" ]; then
+        local -a cfg_names cn
+        IFS=',' read -ra cfg_names <<< "$CONFIG_NAME"
+        for cn in ${cfg_names[@]+"${cfg_names[@]}"}; do
+            cn="${cn#"${cn%%[![:space:]]*}"}"
+            cn="${cn%"${cn##*[![:space:]]}"}"
+            [ -n "$cn" ] && want_name+=("$cn")
+        done
+    fi
 
     if [ "$mode" = "list" ]; then
         local node
@@ -316,7 +355,7 @@ main() {
         usage; exit 2
     fi
 
-    if ! find_device "$want_all"; then
+    if ! find_device "$want_all" ${want_name[@]+"${want_name[@]}"}; then
         echo "No Logitech device supporting ChangeHost found." >&2
         echo "Click the mouse to wake it; check hidraw permissions (see header)." >&2
         exit 1

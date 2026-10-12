@@ -41,6 +41,9 @@ param(
     [switch]$Json,
     [string]$Config,
 
+    # Only act on devices whose product name contains one of these substrings.
+    [string[]]$Name,
+
     # Skip the cached device paths and force a full rescan.
     [switch]$NoCache
 )
@@ -101,7 +104,7 @@ function Get-ReplyVerdict {
 function Get-MxConfig {
     param([string]$Path = $ConfigFile)
 
-    $cfg = [ordered]@{ channel_a = 1; channel_b = 2; device = 'primary' }
+    $cfg = [ordered]@{ channel_a = 1; channel_b = 2; device = 'primary'; name = '' }
     if ($Path -and (Test-Path $Path)) {
         foreach ($line in Get-Content $Path) {
             $clean = ($line -split '#', 2)[0].Trim()
@@ -114,6 +117,7 @@ function Get-MxConfig {
                 'channel_a' { if ($value -match '^[123]$') { $cfg.channel_a = [int]$value } }
                 'channel_b' { if ($value -match '^[123]$') { $cfg.channel_b = [int]$value } }
                 'device'    { $cfg.device = $value.ToLowerInvariant() }
+                'name'      { $cfg.name = $value }
             }
         }
     }
@@ -351,6 +355,17 @@ function Get-DeviceRank {
     return (10 * $tier + $nonVendor)
 }
 
+# No filter set, or the product name contains any of the substrings.
+function Test-MxName {
+    param([string]$Product, [string[]]$Names)
+    if (-not $Names -or $Names.Count -eq 0) { return $true }
+    $p = "$Product".ToLowerInvariant()
+    foreach ($n in $Names) {
+        if ($n -and $p.Contains("$n".ToLowerInvariant())) { return $true }
+    }
+    return $false
+}
+
 <#
     Discovery costs a round trip per candidate collection and device index, so
     the resolved answer is cached. This is purely a latency win: a cached path
@@ -420,9 +435,15 @@ function Save-CachedDevices {
 
 # Returns an array of contexts. With -All, every unique ChangeHost device.
 function Find-MxDevices {
-    param([switch]$All)
+    param([switch]$All, [string[]]$Names)
 
     $cached = @(Get-CachedDevices)
+    # A name filter cannot be answered from the cache, which may only hold the
+    # primary device, so rescan when one is set.
+    if ($cached.Count -gt 0 -and $Names -and $Names.Count -gt 0) {
+        foreach ($c in $cached) { $c.Dev.Close() }
+        $cached = @()
+    }
     if ($cached.Count -gt 0) {
         # A cache written by a non-All run may hold only the primary device, so
         # never satisfy -All from it. Rescan to find every device.
@@ -440,6 +461,7 @@ function Find-MxDevices {
     }
 
     $ifaces = [Hid]::Enumerate($VID) |
+        Where-Object { Test-MxName $_.Product $Names } |
         Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product }
 
     $contexts = @()
@@ -562,6 +584,14 @@ $cfg = Get-MxConfig -Path $(if ($Config) { $Config } else { $ConfigFile })
 if ($Config) { Write-Verbose "config: $Config" }
 $wantAll = $All -or $cfg.device -eq 'all'
 
+# Union of -Name and the config `name` list.
+$cfgNames = @()
+if ($cfg.name) {
+    $cfgNames = @($cfg.name -split ',' | ForEach-Object { "$_".Trim() } |
+                  Where-Object { $_ })
+}
+$nameFilter = @(@($Name) + $cfgNames | Where-Object { $_ })
+
 if ($Toggle) {
     $problems = @(Test-MxConfig $cfg)
     if ($problems.Count -gt 0) {
@@ -573,7 +603,7 @@ if ($Toggle) {
     exit 2
 }
 
-$found = @(Find-MxDevices -All:$wantAll)
+$found = @(Find-MxDevices -All:$wantAll -Names $nameFilter)
 if ($found.Count -eq 0) {
     Write-MxError ('No Logitech device supporting ChangeHost found. Click the mouse ' +
                    'to wake it, then retry. Run with -List to see what enumerated, ' +

@@ -14,6 +14,7 @@ equivalent always-present C API to lean on.
     python mxswitch.py --status      # --info plus battery
     python mxswitch.py 2             # switch to channel 2
     python mxswitch.py --all 2       # switch every ChangeHost device
+    python mxswitch.py 2 --name Keys  # only devices whose name contains "Keys"
     python mxswitch.py --toggle      # switch to the other configured channel
     python mxswitch.py --list        # dump candidate HID interfaces
 
@@ -41,7 +42,7 @@ FRAME_LEN = {SHORT: 7, LONG: 20}
 # 0xFF for a directly-connected device (Bluetooth/USB), 1..6 via a receiver.
 DEVICE_INDICES = (0xFF, 1, 2, 3, 4, 5, 6)
 
-DEFAULT_CONFIG = {"channel_a": 1, "channel_b": 2, "device": "primary"}
+DEFAULT_CONFIG = {"channel_a": 1, "channel_b": 2, "device": "primary", "name": []}
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,14 @@ def device_rank(usage_page, usage, name):
     tier = 2 if (kbd and not mouse) else (0 if mouse else 1)
     non_vendor = 0 if usage_page >= 0xFF00 else 1
     return tier * 10 + non_vendor
+
+
+def name_matches(info, names):
+    """True when no filter is set, or the product name contains any filter."""
+    if not names:
+        return True
+    product = (info["product_string"] or "").lower()
+    return any(n.lower() in product for n in names if n)
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +424,17 @@ def resolve_feature(dev, report_id, dev_idx, feature_id):
     return reply[4] if reply else 0
 
 
-def iter_devices(want_all):
+def iter_devices(want_all, names=None):
     """Yield discovered ChangeHost-capable devices, mouse first.
 
     One physical device can expose several collections that all answer the
     probe; only the first matching collection per (product, device index) is
-    yielded, so `--all` does not switch the same device twice.
+    yielded, so `--all` does not switch the same device twice. `names` limits
+    discovery to devices whose product name contains any of the substrings.
     """
     for info in enumerate_interfaces():
+        if not name_matches(info, names):
+            continue
         try:
             dev = Device(info)
         except OSError:
@@ -530,6 +542,10 @@ def load_config(path=None):
             continue
         key, value = (part.strip() for part in line.split("=", 1))
         key = key.lower()
+        if key == "name":
+            # Comma-separated substrings; keeps internal spaces.
+            cfg["name"] = [p.strip() for p in value.split(",") if p.strip()]
+            continue
         if key in ("channel_a", "channel_b"):
             try:
                 value = int(value)
@@ -609,6 +625,8 @@ def main():
     ap.add_argument("--list", action="store_true", help="dump HID interfaces and exit")
     ap.add_argument("--all", action="store_true",
                     help="switch every ChangeHost device, not just the preferred one")
+    ap.add_argument("--name", action="append", metavar="SUBSTR",
+                    help="only devices whose product name contains SUBSTR (repeatable)")
     ap.add_argument("--toggle", action="store_true",
                     help="switch to the other channel in the configured pair")
     ap.add_argument("--dry-run", action="store_true",
@@ -645,7 +663,8 @@ def main():
         print(f"config     : {args.config or config_path()}", file=sys.stderr)
 
     iter_devices.seen.clear()
-    devices = list(iter_devices(want_all))
+    names = list(args.name or []) + list(cfg.get("name") or [])
+    devices = list(iter_devices(want_all, names))
     if not devices:
         print("No Logitech device supporting ChangeHost found.", file=sys.stderr)
         print("Click the mouse once to wake it, then retry. See also --list.",

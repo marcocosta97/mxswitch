@@ -47,11 +47,11 @@ class FakeDevice:
         self.closed = True
 
 
-def fake_entry(index=0):
+def fake_entry(index=0, name=None):
     dev = FakeDevice()
-    info = {"product_string": f"MX Master {index}", "product_id": 0x0001,
-            "usage_page": 0xFF00, "usage": 0x0001, "path": f"/dev/fake{index}",
-            "in_len": 20, "out_len": 20}
+    info = {"product_string": name if name is not None else f"MX Master {index}",
+            "product_id": 0x0001, "usage_page": 0xFF00, "usage": 0x0001,
+            "path": f"/dev/fake{index}", "in_len": 20, "out_len": 20}
     return (dev, 0xFF, 0x11, 0x0A, info)
 
 
@@ -110,6 +110,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg["channel_b"], 1)
         self.assertEqual(cfg["device"], "all")
 
+    def test_parses_name_list(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            fh.write("name = MX Keys, MX Master 3S ,\n")
+            path = fh.name
+        try:
+            cfg = mx.load_config(path)
+        finally:
+            os.unlink(path)
+        # Internal spaces kept, blanks dropped.
+        self.assertEqual(cfg["name"], ["MX Keys", "MX Master 3S"])
+
     def test_validation_catches_bad_values(self):
         bad = {"channel_a": 1, "channel_b": 1, "device": "all"}
         self.assertIn("channel_a and channel_b must differ",
@@ -120,11 +131,33 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(mx.validate_config(bad))
 
 
+class NameFilterTests(unittest.TestCase):
+    def test_no_filter_matches_everything(self):
+        self.assertTrue(mx.name_matches(fake_entry()[4], None))
+        self.assertTrue(mx.name_matches(fake_entry()[4], []))
+
+    def test_case_insensitive_substring(self):
+        info = fake_entry(name="MX Keys S")[4]
+        self.assertTrue(mx.name_matches(info, ["keys"]))
+        self.assertTrue(mx.name_matches(info, ["KEY"]))
+        self.assertFalse(mx.name_matches(info, ["master"]))
+
+    def test_any_filter_matches(self):
+        info = fake_entry(name="MX Master 3S")[4]
+        self.assertTrue(mx.name_matches(info, ["nope", "master"]))
+
+    def test_unnamed_device_needs_no_filter(self):
+        info = fake_entry(name="")[4]
+        self.assertFalse(mx.name_matches(info, ["master"]))
+        self.assertTrue(mx.name_matches(info, None))
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.orig_iter = mx.iter_devices
         self.orig_host = mx.host_info
         self.devices = []
+        self.names_seen = None
 
     def tearDown(self):
         mx.iter_devices = self.orig_iter
@@ -133,8 +166,11 @@ class CliTests(unittest.TestCase):
     def install(self, entries, host=(3, 0)):
         self.devices = entries
 
-        def fake_iter(want_all):
-            devs = entries if want_all else entries[:1]
+        def fake_iter(want_all, names=None):
+            self.names_seen = names
+            devs = [e for e in entries if mx.name_matches(e[4], names)]
+            if not want_all:
+                devs = devs[:1]
             return iter(devs)
 
         fake_iter.seen = set()
@@ -220,6 +256,38 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(out.lstrip().startswith("["))
         self.assertIn('"product"', out)
+
+    def test_name_filter_selects_matching_device(self):
+        entries = [fake_entry(0, name="MX Master 3S"),
+                   fake_entry(1, name="MX Keys S")]
+        self.install(entries)
+        code, _, _ = self.run_main(["--all", "--name", "keys", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.names_seen, ["keys"])
+        self.assertEqual(entries[0][0].writes, [])
+        self.assertEqual(len(entries[1][0].writes), 1)
+
+    def test_name_filter_without_match_returns_1(self):
+        self.install([fake_entry(0, name="MX Master 3S")])
+        code, _, err = self.run_main(["2", "--name", "nope"])
+        self.assertEqual(code, 1)
+        self.assertIn("No Logitech device", err)
+
+    def test_config_name_filter_is_used(self):
+        entries = [fake_entry(0, name="MX Master 3S"),
+                   fake_entry(1, name="MX Keys S")]
+        self.install(entries)
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            fh.write("name=keys\n")
+            path = fh.name
+        try:
+            code, _, _ = self.run_main(["--all", "--config", path, "2"])
+        finally:
+            os.unlink(path)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.names_seen, ["keys"])
+        self.assertEqual(entries[0][0].writes, [])
+        self.assertEqual(len(entries[1][0].writes), 1)
 
 
 if __name__ == "__main__":

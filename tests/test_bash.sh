@@ -83,12 +83,14 @@ channel_a = 3
 junk line
 channel_b=1
 device = all
+name = MX Keys, MX Master
 EOF
-CONFIG_CHANNEL_A=1 CONFIG_CHANNEL_B=2 CONFIG_DEVICE=primary
+CONFIG_CHANNEL_A=1 CONFIG_CHANNEL_B=2 CONFIG_DEVICE=primary CONFIG_NAME=""
 config_load "$tmp"
 check "config channel_a" "3" "$CONFIG_CHANNEL_A"
 check "config channel_b" "1" "$CONFIG_CHANNEL_B"
 check "config device" "all" "$CONFIG_DEVICE"
+check "config name keeps spaces" "MX Keys, MX Master" "$CONFIG_NAME"
 
 CONFIG_CHANNEL_A=1 CONFIG_CHANNEL_B=1 CONFIG_DEVICE=all
 case "$(config_problems)" in
@@ -102,6 +104,30 @@ case "$(config_problems)" in
 esac
 CONFIG_CHANNEL_A=1 CONFIG_CHANNEL_B=2 CONFIG_DEVICE=primary
 check "valid config has no problems" "" "$(config_problems)"
+
+# --- name filter ------------------------------------------------------------
+if name_matches "MX Master 3S"; then pass=$(( pass + 1 )); else
+    fail=$(( fail + 1 )); echo "FAIL: no filter should match everything"
+fi
+if name_matches "MX Keys S" keys; then pass=$(( pass + 1 )); else
+    fail=$(( fail + 1 )); echo "FAIL: substring should match"
+fi
+if name_matches "mx keys s" KEYS; then pass=$(( pass + 1 )); else
+    fail=$(( fail + 1 )); echo "FAIL: match should be case-insensitive"
+fi
+if name_matches "MX Master 3S" nope master; then pass=$(( pass + 1 )); else
+    fail=$(( fail + 1 )); echo "FAIL: any filter should match"
+fi
+if name_matches "MX Master 3S" keys; then
+    fail=$(( fail + 1 )); echo "FAIL: non-matching filter accepted"
+else
+    pass=$(( pass + 1 ))
+fi
+if name_matches "" keys; then
+    fail=$(( fail + 1 )); echo "FAIL: empty name should not match"
+else
+    pass=$(( pass + 1 ))
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

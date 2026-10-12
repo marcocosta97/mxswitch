@@ -68,6 +68,24 @@ Describe 'Get-ReplyVerdict' {
     }
 }
 
+Describe 'Test-MxName' {
+    It 'matches everything with no filter' {
+        (Test-MxName 'MX Master 3S' @()) | Should -Be $true
+        (Test-MxName 'MX Master 3S' $null) | Should -Be $true
+    }
+    It 'matches a case-insensitive substring' {
+        (Test-MxName 'MX Keys S' @('keys')) | Should -Be $true
+        (Test-MxName 'mx keys s' @('KEYS')) | Should -Be $true
+    }
+    It 'matches when any of several substrings is present' {
+        (Test-MxName 'MX Master 3S' @('nope', 'master')) | Should -Be $true
+    }
+    It 'rejects a non-matching name' {
+        (Test-MxName 'MX Master 3S' @('keys')) | Should -Be $false
+        (Test-MxName '' @('keys')) | Should -Be $false
+    }
+}
+
 Describe 'Get-MxConfig' {
     It 'returns defaults when the file is missing' {
         $cfg = Get-MxConfig -Path (Join-Path $env:TEMP 'mxswitch-does-not-exist')
@@ -77,13 +95,14 @@ Describe 'Get-MxConfig' {
     }
     It 'parses values, comments and junk' {
         $path = Join-Path $env:TEMP 'mxswitch-test-config'
-        @('# comment', 'channel_a = 3', '', 'junk', 'channel_b=1', 'device = all') |
-            Set-Content $path
+        @('# comment', 'channel_a = 3', '', 'junk', 'channel_b=1', 'device = all',
+          'name = MX Keys, MX Master') | Set-Content $path
         try {
             $cfg = Get-MxConfig -Path $path
             $cfg.channel_a | Should -Be 3
             $cfg.channel_b | Should -Be 1
             $cfg.device | Should -Be 'all'
+            $cfg.name | Should -Be 'MX Keys, MX Master'
         } finally {
             Remove-Item $path -ErrorAction SilentlyContinue
         }
