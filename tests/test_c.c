@@ -54,6 +54,32 @@ static void check_reply(const char *name, const char *hex,
     }
 }
 
+static void check_config(void) {
+    char path[] = "/tmp/mxswitch-test-XXXXXX";
+    int fd = mkstemp(path);
+    if (fd < 0) { printf("FAIL: mkstemp\n"); fails++; return; }
+    const char *text = "# comment\nchannel_a = 3\nchannel_b=1\ndevice = all\n";
+    if (write(fd, text, strlen(text)) != (ssize_t)strlen(text)) {
+        printf("FAIL: config write\n"); fails++;
+    }
+    close(fd);
+    config_t c;
+    config_load(&c, path);
+    unlink(path);
+    /* Spaces around '=' must parse, matching the other implementations. */
+    if (c.channel_a != 3 || c.channel_b != 1 || strcmp(c.device, "all") != 0) {
+        printf("FAIL: config spaces parse (a=%d b=%d dev=%s)\n",
+               c.channel_a, c.channel_b, c.device);
+        fails++;
+    }
+    /* A missing file keeps the defaults. */
+    config_load(&c, "/nonexistent/mxswitch/config");
+    if (c.channel_a != 1 || c.channel_b != 2 || strcmp(c.device, "primary") != 0) {
+        printf("FAIL: config defaults\n");
+        fails++;
+    }
+}
+
 int main(void) {
     const uint8_t feature[3] = { 0x18, 0x14, 0x00 };
     const uint8_t empty[1] = { 0 };
@@ -103,6 +129,8 @@ int main(void) {
     check_reply("HID++ 1.0 error",
                 "11ff8f0a00000000000000000000000000000000", 0xFF, 0x0A, REPLY_ERROR);
     check_reply("too short", "11ff0a", 0xFF, 0x0A, REPLY_TOO_SHORT);
+
+    check_config();
 
     if (fails) {
         printf("\n%d test(s) failed\n", fails);

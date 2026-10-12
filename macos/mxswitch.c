@@ -25,6 +25,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <IOKit/hid/IOHIDManager.h>
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -102,11 +103,12 @@ static int classify_reply(const uint8_t *reply, size_t len,
 static uint8_t  g_reply[64];
 static CFIndex  g_reply_len;
 static int      g_got_reply;
+static IOHIDDeviceRef g_reply_dev;
 
 static void input_cb(void *ctx, IOReturn result, void *sender,
                      IOHIDReportType type, uint32_t report_id,
                      uint8_t *report, CFIndex len) {
-    (void)ctx; (void)result; (void)sender; (void)type;
+    (void)ctx; (void)result; (void)type;
 
     if (len <= 0 || len > (CFIndex)sizeof(g_reply) - 1) goto done;
 
@@ -121,6 +123,9 @@ static void input_cb(void *ctx, IOReturn result, void *sender,
         memcpy(g_reply, report, (size_t)len);
         g_reply_len = len;
     }
+    /* Attribute the frame to its device: with several devices open (--all),
+     * two identical models share device index, feature index and software id. */
+    g_reply_dev = (IOHIDDeviceRef)sender;
     g_got_reply = 1;
 
 done:
@@ -128,14 +133,14 @@ done:
 }
 
 /*
- * Send one HID++ call. Returns 1 and fills *out on a matching reply, 0 on
- * timeout or error. Pass out == NULL for fire-and-forget (setCurrentHost never
- * answers - the link is already gone).
+ * Send one HID++ call. Returns 1 and fills *out (and *out_len, if given) on a
+ * matching reply, 0 on timeout or error. Pass out == NULL for fire-and-forget
+ * (setCurrentHost never answers - the link is already gone).
  */
 static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
                       uint8_t feature_idx, uint8_t function,
                       const uint8_t *params, size_t nparams,
-                      uint8_t *out, double timeout_s) {
+                      uint8_t *out, size_t *out_len, double timeout_s) {
     uint8_t frame[20];
     size_t len = frame_build(report_id, dev_idx, feature_idx, function,
                              params, nparams, frame);
@@ -155,10 +160,12 @@ static int hidpp_call(IOHIDDeviceRef dev, uint8_t report_id, uint8_t dev_idx,
         g_reply_len = 0;
         CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
         if (!g_got_reply || g_reply_len < 5) continue;
+        if (g_reply_dev != dev) continue;   /* another open device spoke */
         int verdict = classify_reply(g_reply, (size_t)g_reply_len, dev_idx, feature_idx);
         if (verdict == REPLY_IGNORE || verdict == REPLY_TOO_SHORT) continue;
         if (verdict == REPLY_ERROR) return 0;
         memcpy(out, g_reply, (size_t)g_reply_len);
+        if (out_len) *out_len = (size_t)g_reply_len;
         return 1;
     }
     return 0;
@@ -169,7 +176,8 @@ static uint8_t resolve_feature(IOHIDDeviceRef dev, uint8_t report_id,
                                uint8_t dev_idx, uint16_t feature_id) {
     uint8_t probe[3] = { (uint8_t)(feature_id >> 8), (uint8_t)feature_id, 0 };
     uint8_t reply[64];
-    if (!hidpp_call(dev, report_id, dev_idx, ROOT_FEATURE, 0, probe, 3, reply, 0.3))
+    if (!hidpp_call(dev, report_id, dev_idx, ROOT_FEATURE, 0, probe, 3,
+                    reply, NULL, 0.3))
         return 0;
     return reply[4];
 }
@@ -304,7 +312,7 @@ static int find_devices(device_set_t *set, int want_all, int verbose) {
                     fprintf(stderr, "probing %s index=0x%02x report=0x%02x\n",
                             cands[i].name, DEVICE_INDICES[a], rids[b]);
                 if (!hidpp_call(d, rids[b], DEVICE_INDICES[a], ROOT_FEATURE, 0,
-                                probe, 3, reply, 0.25))
+                                probe, 3, reply, NULL, 0.25))
                     continue;
                 if (reply[4] == 0) continue;     /* feature not supported */
                 matched = 1;
@@ -322,6 +330,13 @@ static int find_devices(device_set_t *set, int want_all, int verbose) {
         }
 
         if (!matched || duplicate) {
+            IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
+                                             kCFRunLoopDefaultMode);
+            IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
+            continue;
+        }
+
+        if (set->count >= MAX_DEVICES) {
             IOHIDDeviceUnscheduleFromRunLoop(d, CFRunLoopGetCurrent(),
                                              kCFRunLoopDefaultMode);
             IOHIDDeviceClose(d, kIOHIDOptionsTypeNone);
@@ -386,6 +401,17 @@ static const char *default_config_path(char *buf, size_t n) {
     return buf;
 }
 
+/* Strict base-10 integer: the whole value must be numeric, else 0. */
+static int config_int(const char *s) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s) return 0;
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end) return 0;
+    if (v < INT_MIN || v > INT_MAX) return 0;
+    return (int)v;
+}
+
 static void config_load(config_t *cfg, const char *path) {
     cfg->channel_a = 1;
     cfg->channel_b = 2;
@@ -399,20 +425,28 @@ static void config_load(config_t *cfg, const char *path) {
     while (fgets(line, sizeof(line), f)) {
         char *hash = strchr(line, '#');
         if (hash) *hash = '\0';
-        /* trim */
         char *s = line;
         while (*s && isspace((unsigned char)*s)) s++;
         char *end = s + strlen(s);
         while (end > s && isspace((unsigned char)end[-1])) *--end = '\0';
         if (!*s) continue;
-        if (strncmp(s, "channel_a", 9) == 0 && s[9] == '=') {
-            cfg->channel_a = atoi(s + 10);   /* stored raw, validated below */
-        } else if (strncmp(s, "channel_b", 9) == 0 && s[9] == '=') {
-            cfg->channel_b = atoi(s + 10);
-        } else if (strncmp(s, "device", 6) == 0 && s[6] == '=') {
-            char *v = s + 7;
-            while (*v && isspace((unsigned char)*v)) v++;
-            snprintf(cfg->device, sizeof(cfg->device), "%s", v);
+
+        /* Split on the first '=' and trim both sides, so "key = value" and
+         * "key=value" both parse. */
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *kend = s + strlen(s);
+        while (kend > s && isspace((unsigned char)kend[-1])) *--kend = '\0';
+        char *value = eq + 1;
+        while (*value && isspace((unsigned char)*value)) value++;
+
+        if (strcmp(s, "channel_a") == 0) {
+            cfg->channel_a = config_int(value);   /* 0 if junk; validated below */
+        } else if (strcmp(s, "channel_b") == 0) {
+            cfg->channel_b = config_int(value);
+        } else if (strcmp(s, "device") == 0) {
+            snprintf(cfg->device, sizeof(cfg->device), "%s", value);
         }
     }
     fclose(f);
@@ -436,9 +470,19 @@ static const char *config_problem(const config_t *cfg) {
 static void json_string(const char *s) {
     putchar('"');
     for (; s && *s; s++) {
-        if (*s == '"' || *s == '\\') { putchar('\\'); putchar(*s); }
-        else if (*s == '\n') fputs("\\n", stdout);
-        else putchar(*s);
+        unsigned char c = (unsigned char)*s;
+        switch (c) {
+        case '"':  fputs("\\\"", stdout); break;
+        case '\\': fputs("\\\\", stdout); break;
+        case '\b': fputs("\\b", stdout); break;
+        case '\f': fputs("\\f", stdout); break;
+        case '\n': fputs("\\n", stdout); break;
+        case '\r': fputs("\\r", stdout); break;
+        case '\t': fputs("\\t", stdout); break;
+        default:
+            if (c < 0x20) printf("\\u%04x", c);
+            else putchar(c);
+        }
     }
     putchar('"');
 }
@@ -454,8 +498,9 @@ static void gather_status(IOHIDDeviceRef dev, const device_info_t *di,
     memset(st, 0, sizeof(*st));
     memset(st->firmware, 0, sizeof(st->firmware));
     uint8_t reply[64];
+    size_t rlen = 0;
     if (hidpp_call(dev, di->report_id, di->dev_idx, di->feature_idx, 0,
-                   NULL, 0, reply, 0.4)) {
+                   NULL, 0, reply, &rlen, 0.4) && rlen >= 6) {
         st->hosts = reply[4];
         st->channel = reply[5] + 1;
     }
@@ -466,7 +511,7 @@ static void gather_status(IOHIDDeviceRef dev, const device_info_t *di,
         uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, bids[i]);
         if (!idx) continue;
         if (!hidpp_call(dev, di->report_id, di->dev_idx, idx, 0,
-                        NULL, 0, reply, 0.3))
+                        NULL, 0, reply, &rlen, 0.3) || rlen < 6)
             continue;
         st->has_battery = 1;
         st->battery = reply[4];
@@ -475,8 +520,9 @@ static void gather_status(IOHIDDeviceRef dev, const device_info_t *di,
 
     uint8_t fw_idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_FW);
     if (fw_idx &&
-        hidpp_call(dev, di->report_id, di->dev_idx, fw_idx, 0, NULL, 0, reply, 0.3) &&
-        reply[4] > 0 && (reply[6] || reply[7]))
+        hidpp_call(dev, di->report_id, di->dev_idx, fw_idx, 0, NULL, 0,
+                   reply, &rlen, 0.3) &&
+        rlen >= 8 && reply[4] > 0 && (reply[6] || reply[7]))
         snprintf(st->firmware, sizeof(st->firmware), "%d.%d", reply[6], reply[7]);
 }
 
@@ -556,15 +602,24 @@ static int spawn_sqlite(const char *db, const char *query,
         return -1;
     }
 
-    ssize_t n = read(pfd[0], out, out_sz - 1);
-    if (n < 0) n = 0;
-    out[n] = '\0';
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = read(pfd[0], out + total, out_sz - 1 - total);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        total += (size_t)n;
+        if (total >= out_sz - 1) break;
+    }
+    out[total] = '\0';
     close(pfd[0]);
 
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) return -1;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
-    return (int)n;
+    return (int)total;
 }
 
 /*
@@ -635,6 +690,7 @@ static int setup_input_monitoring(void) {
 
 typedef struct {
     const char *mode;             /* info status list toggle setup, or NULL */
+    int mode_count;               /* how many mode flags were given */
     int channel;                  /* 0 = unset */
     int all, dry, json, verbose;
     const char *config_path;
@@ -653,17 +709,23 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "1") || !strcmp(a, "2") || !strcmp(a, "3")) o.channel = atoi(a);
-        else if (!strcmp(a, "--info")) o.mode = "info";
-        else if (!strcmp(a, "--status")) o.mode = "status";
-        else if (!strcmp(a, "--toggle")) o.mode = "toggle";
-        else if (!strcmp(a, "--list")) o.mode = "list";
-        else if (!strcmp(a, "--setup")) o.mode = "setup";
+        else if (!strcmp(a, "--info")) { o.mode = "info"; o.mode_count++; }
+        else if (!strcmp(a, "--status")) { o.mode = "status"; o.mode_count++; }
+        else if (!strcmp(a, "--toggle")) { o.mode = "toggle"; o.mode_count++; }
+        else if (!strcmp(a, "--list")) { o.mode = "list"; o.mode_count++; }
+        else if (!strcmp(a, "--setup")) { o.mode = "setup"; o.mode_count++; }
         else if (!strcmp(a, "--all")) o.all = 1;
         else if (!strcmp(a, "--dry-run")) o.dry = 1;
         else if (!strcmp(a, "--json")) o.json = 1;
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
         else if (!strcmp(a, "--config") && i + 1 < argc) o.config_path = argv[++i];
         else { usage(argv[0]); return 2; }
+    }
+
+    if (o.mode_count > 1) {
+        fprintf(stderr, "--info, --status, --toggle, --list and --setup are "
+                        "mutually exclusive\n");
+        return 2;
     }
 
     if (o.mode && !strcmp(o.mode, "setup"))
@@ -723,7 +785,7 @@ int main(int argc, char **argv) {
     if (o.mode && !strcmp(o.mode, "toggle")) {
         uint8_t reply[64];
         if (!hidpp_call(set.devs[0], set.info[0].report_id, set.info[0].dev_idx,
-                        set.info[0].feature_idx, 0, NULL, 0, reply, 0.4)) {
+                        set.info[0].feature_idx, 0, NULL, 0, reply, NULL, 0.4)) {
             fprintf(stderr, "Could not read the current channel.\n");
             devices_release(&set);
             return 1;
@@ -766,7 +828,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < set.count; i++) {
         int sent = hidpp_call(set.devs[i], set.info[i].report_id,
                               set.info[i].dev_idx, set.info[i].feature_idx,
-                              1, &host, 1, NULL, 0);
+                              1, &host, 1, NULL, NULL, 0);
         if (sent) printf("  %s: command sent\n", set.info[i].name);
         else { fprintf(stderr, "  %s: failed\n", set.info[i].name); failures++; }
     }
