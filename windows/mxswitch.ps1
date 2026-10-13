@@ -147,7 +147,7 @@ function Test-MxConfig {
     return $problems
 }
 
-function Format-Hex {
+function Format-MxHex {
     param([byte[]]$Bytes)
     ($Bytes | ForEach-Object { $_.ToString('x2') }) -join ''
 }
@@ -500,7 +500,7 @@ function Get-MxMetadata {
     if ($idx) {
         $r = Invoke-HidppCall $Dev $ReportId $DevIdx $idx 0
         if ($r -and $r.Length -ge 9 -and ($r[5] -or $r[6] -or $r[7] -or $r[8])) {
-            $identity = 'unit:' + (Format-Hex ([byte[]]$r[5..8]))
+            $identity = 'unit:' + (Format-MxHex ([byte[]]$r[5..8]))
         }
     }
     [pscustomobject]@{ Product = $product; Identity = $identity }
@@ -752,7 +752,7 @@ if ($Channel -lt 1 -or $Channel -gt 3) {
 if ($DryRun) {
     foreach ($c in $found) {
         $frame = New-HidppFrame $c.ReportId $c.DevIdx $c.FeatureIdx 1 ([byte[]]@($Channel - 1))
-        '{0}: switch to channel {1} -> {2}' -f $c.Iface.Product, $Channel, (Format-Hex $frame)
+        '{0}: switch to channel {1} -> {2}' -f $c.Iface.Product, $Channel, (Format-MxHex $frame)
     }
     Close-MxDevices $found
     exit 0

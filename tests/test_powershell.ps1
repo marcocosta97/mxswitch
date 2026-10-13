@@ -76,7 +76,7 @@ Describe 'Shared protocol cases' {
         $fixtures.frames.Count | Should -BeGreaterThan 0
         foreach ($f in $fixtures.frames) {
             $frame = New-HidppFrame $f.report_id $f.device_index $f.feature_index $f.function ([byte[]]$f.params)
-            (Format-Hex $frame) | Should -Be $f.hex -Because $f.name
+            (Format-MxHex $frame) | Should -Be $f.hex -Because $f.name
         }
     }
     It 'classifies all shared replies' {
@@ -89,6 +89,10 @@ Describe 'Shared protocol cases' {
     }
     It 'rejects an oversized short frame' {
         { New-HidppFrame 16 255 0 0 ([byte[]]@(1,2,3,4)) } | Should -Throw
+    }
+    It 'keeps hex formatting when the PowerShell utility module is imported' {
+        Import-Module Microsoft.PowerShell.Utility -Force
+        (Format-MxHex ([byte[]]@(5, 124, 54, 19))) | Should -Be '057c3613'
     }
 }
 
