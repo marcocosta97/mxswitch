@@ -113,7 +113,7 @@ def name_matches(info, names):
     """True when no filter is set, or the product name contains any filter."""
     if not names:
         return True
-    product = (info["product_string"] or "").lower()
+    product = (info.get("filter_name", info["product_string"]) or "").lower()
     return any(n.lower() in product for n in names if n)
 
 
@@ -409,7 +409,8 @@ else:
                 raise
 
         def write(self, data):
-            self.dev.write(bytes(data))
+            if self.dev.write(bytes(data)) != len(data):
+                raise OSError("HIDAPI did not write the full report")
 
         def read(self, timeout_ms=100):
             return bytes(self.dev.read(FRAME_LEN[LONG], timeout_ms=timeout_ms))
@@ -465,8 +466,10 @@ def interface_identity(info):
 def device_metadata(dev, report_id, dev_idx, info):
     """Use the peripheral's HID++ name and unit ID, not the receiver's name."""
     product = info.get("product_string") or ""
+    filter_name = product
     if dev_idx != 0xFF:
         product = f"{product or 'receiver'} (slot {dev_idx})"
+        filter_name = ""
         idx = resolve_feature(dev, report_id, dev_idx, FEAT_DEVICE_NAME)
         if idx:
             reply = request(dev, report_id, dev_idx, idx, 0)
@@ -479,14 +482,14 @@ def device_metadata(dev, report_id, dev_idx, info):
                         break
                     raw.extend(fragment[4:4 + length - len(raw)])
                 if len(raw) == length:
-                    product = raw.decode("utf-8", errors="replace")
+                    filter_name = product = raw.decode("utf-8", errors="replace")
     identity = (interface_identity(info), dev_idx)
     idx = resolve_feature(dev, report_id, dev_idx, FEAT_DEVICE_FW)
     if idx:
         reply = request(dev, report_id, dev_idx, idx, 0)
         if reply and len(reply) >= 9 and any(reply[5:9]):
             identity = ("unit", reply[5:9].hex())
-    return dict(info, product_string=product), identity
+    return dict(info, product_string=product, filter_name=filter_name), identity
 
 
 def close_devices(entries, keep=None):

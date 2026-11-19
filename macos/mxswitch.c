@@ -200,6 +200,7 @@ static uint8_t resolve_feature(IOHIDDeviceRef dev, uint8_t report_id,
 
 typedef struct {
     uint8_t dev_idx, report_id, feature_idx;
+    bool has_name;
     char name[256];
     char identity[256];
     int rank;
@@ -294,6 +295,7 @@ static void device_metadata(IOHIDDeviceRef dev, device_info_t *di, uint64_t phys
     size_t len = 0;
     snprintf(di->identity, sizeof(di->identity), "%llu:%u",
              (unsigned long long)physical, di->dev_idx);
+    di->has_name = di->dev_idx == 0xFF;
     if (di->dev_idx != 0xFF) {
         snprintf(di->name, sizeof(di->name), "receiver (slot %u)", di->dev_idx);
         uint8_t idx = resolve_feature(dev, di->report_id, di->dev_idx, FEAT_DEVICE_NAME);
@@ -313,6 +315,7 @@ static void device_metadata(IOHIDDeviceRef dev, device_info_t *di, uint64_t phys
             if (used == total) {
                 name[used] = '\0';
                 snprintf(di->name, sizeof(di->name), "%s", name);
+                di->has_name = di->name[0] != '\0';
             }
         }
     }
@@ -400,7 +403,7 @@ static int find_devices(device_set_t *set, int want_all, int verbose,
             int duplicate = 0;
             for (int k = 0; k < set->count; k++)
                 if (!strcmp(set->info[k].identity, di.identity)) duplicate = 1;
-            if (!duplicate && name_matches(di.name, names, name_count)) {
+            if (!duplicate && name_matches(di.has_name ? di.name : "", names, name_count)) {
                 if (set->count == MAX_DEVICES) {
                     fprintf(stderr, "Too many devices; maximum is %d.\n", MAX_DEVICES);
                     if (!retained) device_close(d, rxbuf);

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -251,6 +252,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(self.devices[0][0].writes), 1)
         self.assertEqual(self.devices[1][0].writes, [])
 
+    @unittest.skipIf(sys.platform == "win32", "uses the HIDAPI backend")
+    def test_failed_hidapi_write_is_reported(self):
+        dev = mx.Device.__new__(mx.Device)
+        dev.dev = SimpleNamespace(write=lambda _: -1, close=lambda: None)
+        _, *context = fake_entry()
+        self.install([(dev, *context)])
+        code, out, err = self.run_main(["2"])
+        self.assertEqual(code, 1)
+        self.assertNotIn("command sent", out)
+        self.assertIn("HIDAPI did not write the full report", err)
+
     def test_all_switch_writes_to_every_device(self):
         self.install([fake_entry(0), fake_entry(1)])
         code, _, _ = self.run_main(["--all", "2"])
@@ -436,6 +448,14 @@ class DiscoveryTests(unittest.TestCase):
         found, _ = self.discover([info], names=['Keys'])
         self.assertEqual([d[4]['product_string'] for d in found], [name])
         mx.close_devices(found)
+
+    def test_receiver_fallback_is_display_only(self):
+        info = protocol_info('receiver', {1: dict(name='', unit=1)})
+        found, _ = self.discover([info])
+        self.assertIn('slot 1', found[0][4]['product_string'])
+        mx.close_devices(found)
+        found, _ = self.discover([info], names=['receiver'])
+        self.assertEqual(found, [])
 
     def test_same_model_is_retained_but_collections_are_deduplicated(self):
         infos = [protocol_info('mouse-a-col1', {255:dict(name='MX Master 3S',unit=1)}, 'MX Master 3S'),

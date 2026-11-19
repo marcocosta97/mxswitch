@@ -155,6 +155,12 @@ static void check_discovery(void) {
         printf("FAIL: primary selection\n"); fails++;
     }
     devices_release(&set);
+    receiver.names[1] = collection.names[1] = "";
+    const char *fallback[] = { "receiver" };
+    if (find_devices(&set, 1, 0, fallback, 1) != 0) {
+        printf("FAIL: receiver fallback matched a name filter\n"); fails++;
+    }
+    devices_release(&set);
     CFRelease(receiver.properties); CFRelease(collection.properties); CFRelease(mouse.properties);
     CFRelease(fake_devices);
 }
