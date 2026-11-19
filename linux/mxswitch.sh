@@ -26,6 +26,7 @@
 set -uo pipefail
 
 SW_ID=10                 # software id, any value 1..15
+NEXT_SW_ID=$SW_ID
 FEAT_CHANGE_HOST_HI=0x18
 FEAT_CHANGE_HOST_LO=0x14
 DEVICE_INDICES=(255 1 2 3 4 5 6)
@@ -154,29 +155,24 @@ hidpp_send() {
     printf '%b' "$esc" >&"$fd"
 }
 
-# hidpp_call <fd> <report_id> <dev_idx> <feature_idx> <function> [params...]
-# Echoes the matching reply as a hex string, or nothing.
+# hidpp_call <output_var> <fd> <report_id> <dev_idx> <feature_idx> <function> [params...]
 hidpp_call() {
-    local fd=$1 rid=$2 didx=$3 fidx=$4 func=$5; shift 5
-    # Clear queued notifications/replies before issuing a new request.
+    local output_var=$1 fd=$2 rid=$3 didx=$4 fidx=$5 func=$6; shift 6
+    local SW_ID=$NEXT_SW_ID
+    NEXT_SW_ID=$(( 8 + (NEXT_SW_ID - 7) % 8 ))
+    # Keep the ID in this shell so a late reply cannot match the next request.
     timeout 0.01 dd bs=64 count=16 status=none <&"$fd" >/dev/null 2>&1 || true
-    local hex; hex=$(hidpp_build_frame "$rid" "$didx" "$fidx" "$func" "$@") \
-        || return 1
-    local esc="" i
-    for (( i=0; i<${#hex}; i+=2 )); do esc+="\\x${hex:i:2}"; done
-    printf '%b' "$esc" >&"$fd" || return 1
+    hidpp_send "$fd" "$rid" "$didx" "$fidx" "$func" "$@" || return 1
 
-    # Replies share the pipe with unsolicited notifications, so read a few.
-    local try reply verdict
+    local try raw_reply verdict
     for (( try=0; try<3; try++ )); do
-        reply=$(timeout "$READ_TIMEOUT" dd bs=64 count=1 status=none <&"$fd" \
-                2>/dev/null | od -An -v -tx1 | tr -d ' \n')
-        [ -n "$reply" ] || return 1
-        verdict=$(hidpp_classify_reply "$reply" "$didx" "$fidx" "$func")
+        raw_reply=$(timeout "$READ_TIMEOUT" dd bs=64 count=1 status=none <&"$fd" \
+                    2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+        [ -n "$raw_reply" ] || return 1
+        verdict=$(hidpp_classify_reply "$raw_reply" "$didx" "$fidx" "$func")
         case "$verdict" in
-            match) printf '%s' "$reply"; return 0 ;;
+            match) printf -v "$output_var" '%s' "$raw_reply"; return 0 ;;
             error) return 1 ;;
-            *) continue ;;                # too short or a notification
         esac
     done
     return 1
@@ -202,15 +198,17 @@ hidraw_identity() {
 device_metadata() {
     local fd=$1 rid=$2 didx=$3 fallback=$4 identity=$5 reply idx length offset fragment hex="" part
     META_NAME=$fallback
+    META_FILTER_NAME=$fallback
     META_KEY="$identity:$didx"
     if [ "$didx" -ne 255 ]; then
         META_NAME="${fallback:-receiver} (slot $didx)"
-        if reply=$(hidpp_call "$fd" "$rid" "$didx" 0 0 0 5 0); then
+        META_FILTER_NAME=""
+        if hidpp_call reply "$fd" "$rid" "$didx" 0 0 0 5 0; then
             idx=$(( 0x$(byte "$reply" 4) ))
-            if [ "$idx" -gt 0 ] && reply=$(hidpp_call "$fd" "$rid" "$didx" "$idx" 0); then
+            if [ "$idx" -gt 0 ] && hidpp_call reply "$fd" "$rid" "$didx" "$idx" 0; then
                 length=$(( 0x$(byte "$reply" 4) )); offset=0
                 while [ "$offset" -lt "$length" ]; do
-                    fragment=$(hidpp_call "$fd" "$rid" "$didx" "$idx" 1 "$offset") || break
+                    hidpp_call fragment "$fd" "$rid" "$didx" "$idx" 1 "$offset" || break
                     part=${fragment:8:$(( (length-offset)*2 ))}
                     [ -n "$part" ] || break
                     hex+=$part; offset=$(( ${#hex}/2 ))
@@ -219,13 +217,14 @@ device_metadata() {
                     local esc="" i
                     for (( i=0; i<${#hex}; i+=2 )); do esc+="\\x${hex:i:2}"; done
                     META_NAME=$(printf '%b' "$esc")
+                    META_FILTER_NAME=$META_NAME
                 fi
             fi
         fi
     fi
-    if reply=$(hidpp_call "$fd" "$rid" "$didx" 0 0 0 3 0); then
+    if hidpp_call reply "$fd" "$rid" "$didx" 0 0 0 3 0; then
         idx=$(( 0x$(byte "$reply" 4) ))
-        if [ "$idx" -gt 0 ] && reply=$(hidpp_call "$fd" "$rid" "$didx" "$idx" 0) &&
+        if [ "$idx" -gt 0 ] && hidpp_call reply "$fd" "$rid" "$didx" "$idx" 0 &&
            [ "${#reply}" -ge 18 ] && [ "${reply:10:8}" != 00000000 ]; then
             META_KEY="unit:${reply:10:8}"
         fi
@@ -233,7 +232,7 @@ device_metadata() {
 }
 
 DEV_NODES=(); DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
-META_NAME="" META_KEY=""
+META_NAME="" META_FILTER_NAME="" META_KEY=""
 
 # Close each shared transport once. With keep set, retain the primary transport.
 close_devices() {
@@ -267,8 +266,8 @@ find_device() {
             matched=0
             for rid in "${REPORT_IDS[@]}"; do
                 [ "${VERBOSE:-0}" -eq 1 ] && printf 'probing %s index=%s report=%s\n' "$name" "$didx" "$rid" >&2
-                reply=$(hidpp_call "$fd" "$rid" "$didx" 0 0 \
-                        "$FEAT_CHANGE_HOST_HI" "$FEAT_CHANGE_HOST_LO" 0) || continue
+                hidpp_call reply "$fd" "$rid" "$didx" 0 0 \
+                        "$FEAT_CHANGE_HOST_HI" "$FEAT_CHANGE_HOST_LO" 0 || continue
                 fidx=$(( 0x$(byte "$reply" 4) ))
                 [ "$fidx" -ne 0 ] || continue
                 matched=1; break
@@ -277,7 +276,7 @@ find_device() {
             device_metadata "$fd" "$rid" "$didx" "$name" "$identity"
             duplicate=0
             for key in ${seen[@]+"${seen[@]}"}; do [ "$key" = "$META_KEY" ] && duplicate=1; done
-            if [ "$duplicate" -eq 0 ] && name_matches "$META_NAME" "$@"; then
+            if [ "$duplicate" -eq 0 ] && name_matches "$META_FILTER_NAME" "$@"; then
                 seen+=("$META_KEY"); retained=1
                 DEV_NODES+=("$node"); DEV_FDS+=("$fd"); DEV_RIDS+=("$rid")
                 DEV_DIDX+=("$didx"); DEV_FIDX+=("$fidx"); DEV_NAMES+=("$META_NAME")
@@ -309,51 +308,52 @@ find_device() {
     fi
 }
 
-# Echoes "<percent> <charging 0|1>". Returns 1 if unsupported.
+# Stores "<percent> <charging 0|1>". Returns 1 if unsupported.
 battery_status() {
-    local fd=$1 rid=$2 didx=$3 feat reply fidx function status percent
+    local output_var=$1 fd=$2 rid=$3 didx=$4 feat reply fidx function status percent
     for feat in 0x1004 0x1000; do
-        reply=$(hidpp_call "$fd" "$rid" "$didx" 0 0 \
-                "$(( feat >> 8 ))" "$(( feat & 0xff ))" 0) || continue
+        hidpp_call reply "$fd" "$rid" "$didx" 0 0 \
+                "$(( feat >> 8 ))" "$(( feat & 0xff ))" 0 || continue
         fidx=$(( 0x$(byte "$reply" 4) ))
         [ "$fidx" -ne 0 ] || continue
         function=0; [ "$feat" = 0x1004 ] && function=1
-        reply=$(hidpp_call "$fd" "$rid" "$didx" "$fidx" "$function") || continue
+        hidpp_call reply "$fd" "$rid" "$didx" "$fidx" "$function" || continue
         [ "${#reply}" -ge 14 ] || continue
         percent=$(( 0x$(byte "$reply" 4) )); status=$(( 0x$(byte "$reply" 6) ))
         [ "$percent" -gt 0 ] && [ "$percent" -le 100 ] || continue
         local charging=0
         [ "$status" -eq 1 ] || [ "$status" -eq 2 ] && charging=1
-        printf '%d %d' "$percent" "$charging"
+        printf -v "$output_var" '%d %d' "$percent" "$charging"
         return 0
     done
     return 1
 }
 
-# Echoes main firmware version. Returns 1 if unsupported.
+# Stores main firmware version. Returns 1 if unsupported.
 firmware_version() {
-    local fd=$1 rid=$2 didx=$3 reply fidx count entity build
-    reply=$(hidpp_call "$fd" "$rid" "$didx" 0 0 0 3 0) || return 1
+    local output_var=$1 fd=$2 rid=$3 didx=$4 reply fidx count entity build version
+    hidpp_call reply "$fd" "$rid" "$didx" 0 0 0 3 0 || return 1
     fidx=$(( 0x$(byte "$reply" 4) ))
     [ "$fidx" -ne 0 ] || return 1
-    reply=$(hidpp_call "$fd" "$rid" "$didx" "$fidx" 0) || return 1
+    hidpp_call reply "$fd" "$rid" "$didx" "$fidx" 0 || return 1
     count=$(( 0x$(byte "$reply" 4) ))
     for (( entity=0; entity<count; entity++ )); do
-        reply=$(hidpp_call "$fd" "$rid" "$didx" "$fidx" 1 "$entity") || continue
+        hidpp_call reply "$fd" "$rid" "$didx" "$fidx" 1 "$entity" || continue
         [ "${#reply}" -ge 24 ] && [ "$(( 0x$(byte "$reply" 4) & 15 ))" -eq 0 ] || continue
-        printf '%02X.%02X' "$(( 0x$(byte "$reply" 8) ))" "$(( 0x$(byte "$reply" 9) ))"
+        printf -v version '%02X.%02X' "$(( 0x$(byte "$reply" 8) ))" "$(( 0x$(byte "$reply" 9) ))"
         build=$(( 0x${reply:20:4} ))
-        [ "$build" -ne 0 ] && printf '.B%04X' "$build"
+        if [ "$build" -ne 0 ]; then printf -v version '%s.B%04X' "$version" "$build"; fi
+        printf -v "$output_var" '%s' "$version"
         return 0
     done
     return 1
 }
 
 host_info() {
-    # Echoes "hosts current0" from getHostInfo.
-    local fd=$1 rid=$2 didx=$3 fidx=$4 reply
-    reply=$(hidpp_call "$fd" "$rid" "$didx" "$fidx" 0) || return 1
-    printf '%d %d' "$(( 0x$(byte "$reply" 4) ))" "$(( 0x$(byte "$reply" 5) ))"
+    # Stores "hosts current0" from getHostInfo.
+    local output_var=$1 fd=$2 rid=$3 didx=$4 fidx=$5 reply
+    hidpp_call reply "$fd" "$rid" "$didx" "$fidx" 0 || return 1
+    printf -v "$output_var" '%d %d' "$(( 0x$(byte "$reply" 4) ))" "$(( 0x$(byte "$reply" 5) ))"
 }
 
 # ---------------------------------------------------------------------------
@@ -365,9 +365,9 @@ config_file() {
 }
 
 config_load() {
-    local file=$1 line key value
-    if [ -e "$file" ] && [ ! -r "$file" ]; then echo "Cannot read config: $file" >&2; return 1; fi
-    [ -r "$file" ] || return 0
+    local file=$1 line="" key value
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then return 0; fi
+    if [ ! -f "$file" ] || [ ! -r "$file" ]; then echo "Cannot read config file: $file" >&2; return 1; fi
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line%%#*}
         case "$line" in *=*) ;; *) continue ;; esac
@@ -482,7 +482,7 @@ main() {
         exit 0
     fi
 
-    if [ -n "$config" ] && [ ! -r "$config" ]; then
+    if [ -n "$config" ] && { [ ! -f "$config" ] || [ ! -r "$config" ]; }; then
         echo "Cannot read config: $config" >&2; exit 2
     fi
     config=${config:-$(config_file)}
@@ -522,19 +522,19 @@ main() {
         local i first=1
         [ "$json" -eq 1 ] && printf '['
         for (( i=0; i<n; i++ )); do
-            local transport hosts battery="" charging="" fw=""
+            local transport hosts="" battery="" charging="" fw=""
             transport="receiver"; [ "$(( DEV_DIDX[i] ))" -eq 255 ] \
                 && transport="direct (BT/USB)"
             if [ "$mode" = "status" ]; then
                 local battery_pair=""
-                if battery_pair=$(battery_status "${DEV_FDS[$i]}" \
-                        "${DEV_RIDS[$i]}" "${DEV_DIDX[$i]}"); then
+                if battery_status battery_pair "${DEV_FDS[$i]}" \
+                        "${DEV_RIDS[$i]}" "${DEV_DIDX[$i]}"; then
                     battery=${battery_pair% *}
                     charging=${battery_pair#* }
                 fi
-                fw=$(firmware_version "${DEV_FDS[$i]}" "${DEV_RIDS[$i]}" \
-                     "${DEV_DIDX[$i]}" || true)
+                firmware_version fw "${DEV_FDS[$i]}" "${DEV_RIDS[$i]}" "${DEV_DIDX[$i]}" || true
             fi
+            host_info hosts "${DEV_FDS[$i]}" "${DEV_RIDS[$i]}" "${DEV_DIDX[$i]}" "${DEV_FIDX[$i]}" || true
             if [ "$json" -eq 1 ]; then
                 [ "$first" -eq 0 ] && printf ','
                 first=0
@@ -542,11 +542,8 @@ main() {
                     "$(json_escape "${DEV_NAMES[$i]}")" "$transport" "${DEV_DIDX[$i]}"
                 printf '"report_id":%d,"feature_index":%d' \
                     "$(( DEV_RIDS[i] ))" "${DEV_FIDX[$i]}"
-                if hosts=$(host_info "${DEV_FDS[$i]}" "${DEV_RIDS[$i]}" \
-                           "${DEV_DIDX[$i]}" "${DEV_FIDX[$i]}") || true; then
-                    [ -n "${hosts:-}" ] && printf ',"hosts":%d,"channel":%d' \
-                        "${hosts% *}" "$(( ${hosts#* } + 1 ))"
-                fi
+                [ -n "$hosts" ] && printf ',"hosts":%d,"channel":%d' \
+                    "${hosts% *}" "$(( ${hosts#* } + 1 ))"
                 [ -n "$battery" ] && printf ',"battery_percent":%d,"charging":%s' \
                     "$battery" "$([ "$charging" -eq 1 ] && echo true || echo false)"
                 [ -n "$fw" ] && printf ',"firmware":"%s"' "$fw"
@@ -558,8 +555,7 @@ main() {
             echo "device     : ${DEV_NAMES[$i]}"
             echo "transport  : $transport  index=0x$(printf '%02x' "${DEV_DIDX[$i]}")  report=0x$(printf '%02x' "$(( DEV_RIDS[i] ))")"
             echo "ChangeHost : feature index 0x$(printf '%02x' "${DEV_FIDX[$i]}")"
-            if hosts=$(host_info "${DEV_FDS[$i]}" "${DEV_RIDS[$i]}" \
-                       "${DEV_DIDX[$i]}" "${DEV_FIDX[$i]}") && [ -n "$hosts" ]; then
+            if [ -n "$hosts" ]; then
                 echo "channels   : ${hosts% *}, currently on $(( ${hosts#* } + 1 ))"
             fi
             if [ -n "$battery" ]; then
@@ -576,8 +572,8 @@ main() {
     local current target
     if [ "$mode" = "toggle" ]; then
         local hosts
-        hosts=$(host_info "${DEV_FDS[0]}" "${DEV_RIDS[0]}" \
-                "${DEV_DIDX[0]}" "${DEV_FIDX[0]}") || {
+        host_info hosts "${DEV_FDS[0]}" "${DEV_RIDS[0]}" \
+                "${DEV_DIDX[0]}" "${DEV_FIDX[0]}" || {
             echo "Could not read the current channel." >&2; exit 1; }
         current=$(( ${hosts#* } + 1 ))
         if [ "$current" -eq "$CONFIG_CHANNEL_A" ]; then

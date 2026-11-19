@@ -36,6 +36,26 @@ if hidpp_build_frame 16 255 0 0 1 2 3 4 5 6 7 >/dev/null 2>&1; then
     fail=$((fail+1)); echo 'FAIL: oversize frame accepted'
 else pass=$((pass+1)); fi
 
+# Simulate a late root reply after the drain, followed by the matching reply.
+check 'ignores a late root reply by rotating the request ID' '05,0a' "$(
+    pending=$(mktemp); trap 'rm -f "$pending"' EXIT
+    exec {fake_fd}<>/dev/null
+    timeout() {
+        [ "$1" = 0.01 ] && return 124
+        local header feature
+        IFS=' ' read -r header feature <"$pending" || return 124
+        sed '1d' "$pending" >"$pending.next"
+        mv "$pending.next" "$pending"
+        printf '%b' "\x11\xff\x00\x$header\x$feature"
+        printf '\x00%.0s' {1..15}
+    }
+    printf '0a 05\n' >"$pending"
+    hidpp_call first "$fake_fd" 17 255 0 0 0 5 0 || exit 1
+    printf '0a 05\n0b 0a\n' >"$pending"
+    hidpp_call second "$fake_fd" 17 255 0 0 0x18 0x14 0 || exit 1
+    printf '%s,%s' "$(byte "$first" 4)" "$(byte "$second" 4)"
+)"
+
 # --- config -----------------------------------------------------------------
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
@@ -105,10 +125,16 @@ touch "$receiver" "$receiver_copy" "$mouse"
 trap 'rm -f "$tmp" "$receiver" "$receiver_copy" "$mouse"' EXIT
 logitech_hidraws() { printf '%s\n' "$receiver" "$receiver_copy" "$mouse"; }
 hidraw_name() { echo 'USB Receiver'; }
+hidpp_call() {
+    local mock_output=$1 mock_value; shift
+    mock_value=$(fake_hidpp_reply "$@") || return 1
+    printf -v "$mock_output" '%s' "$mock_value"
+}
+
 hidraw_identity() {
     if [ "$1" = "$mouse" ]; then echo mouse; else echo receiver; fi
 }
-hidpp_call() {
+fake_hidpp_reply() {
     local fd=$1 rid=$2 didx=$3 fidx=$4 func=$5; shift 5
     local idx=0 name
     if [ "$didx" -eq 255 ]; then return 1; fi
@@ -117,6 +143,7 @@ hidpp_call() {
         case "$(( $1 )):$(( $2 ))" in 24:20) idx=10 ;; 0:5) idx=5 ;; 0:3) idx=3 ;; esac
         printf '11%02x000a%02x000000000000000000000000000000' "$didx" "$idx"
     elif [ "$fidx" -eq 5 ]; then
+        if [ "${unnamed_slot:-0}" -eq "$didx" ]; then return 1; fi
         name='MX Keys S'; [ "$didx" -eq 2 ] && name='MX Master 3S'
         if [ "$func" -eq 0 ]; then printf '11%02x050a%02x000000000000000000000000000000' "$didx" "${#name}"
         else local data; data=$(printf '%s' "${name:$1}" | od -An -v -tx1 | tr -d ' \n');
@@ -138,37 +165,44 @@ close_devices
 find_device 0
 check 'primary is mouse from receiver slot 2' '2' "${DEV_DIDX[0]}"
 close_devices
+unnamed_slot=1
+check 'receiver fallback does not match a name filter' '1' "$(find_device 1 Receiver; printf '%s' "$?")"
+unset unnamed_slot
+
 
 # Conflicting modes fail before any transport is opened.
 config_file() { echo /nonexistent/mxswitch/config; }
 check 'conflicting modes exit 2' '2' "$( (main --info --toggle --dry-run >/dev/null 2>&1); echo $?)"
 
 # Battery charging comes from the status byte, not the next discharge level.
-hidpp_call() {
+fake_hidpp_reply() {
     if [ "$4" -eq 0 ]; then printf '11ff000a06000000000000000000000000000000'
     elif [ "$5" -eq 1 ]; then printf '11ff061a58500100000000000000000000000000'
     else printf '11ff060a02080000000000000000000000000000'; fi
 }
-check 'unified battery queries function 1' '88 1' "$(battery_status 0 17 255)"
-hidpp_call() {
+check 'unified battery queries function 1' '88 1' "$(battery_status result 0 17 255 && printf '%s' "$result")"
+fake_hidpp_reply() {
     if [ "$4" -eq 0 ]; then
         if [ "$6" -eq 16 ] && [ "$7" -eq 4 ]; then return 1; fi
         printf '11ff000a07000000000000000000000000000000'
     else printf '11ff070a58500000000000000000000000000000'; fi
 }
-check 'legacy battery status ignores next level' '88 0' "$(battery_status 0 17 255)"
-hidpp_call() {
+check 'legacy battery status ignores next level' '88 0' "$(battery_status result 0 17 255 && printf '%s' "$result")"
+fake_hidpp_reply() {
     if [ "$4" -eq 0 ]; then printf '11ff000a03000000000000000000000000000000'
     elif [ "$5" -eq 0 ]; then printf '11ff030a02000000000000000000000000000000'
     elif [ "$6" -eq 0 ]; then printf '11ff031a01524d501234abcd0000000000000000'
     else printf '11ff031a00524d501234abcd0000000000000000'; fi
 }
-check 'firmware queries main entity after bootloader' '12.34.BABCD' "$(firmware_version 0 17 255)"
+check 'firmware queries main entity after bootloader' '12.34.BABCD' "$(firmware_version result 0 17 255 && printf '%s' "$result")"
 
 check 'edge forwards an explicit channel and preserves switch arguments' \
     "<right><1><--config><$tmp><--all><--name><MX Keys><--dry-run><1>" \
     "$(watch_edge() { printf '<%s>' "$@"; }
        main --config "$tmp" --all --edge right --name 'MX Keys' --dry-run 1)"
+check 'config rejects a directory' '2' \
+    "$( (main --config "$here" --toggle) >/dev/null 2>&1; printf '%s' "$?")"
+
 check 'edge rejects a missing channel' '2' \
     "$( (main --edge right --info) >/dev/null 2>&1; printf '%s' "$?")"
 
