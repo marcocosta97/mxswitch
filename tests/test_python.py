@@ -215,6 +215,35 @@ class CliTests(unittest.TestCase):
         self.assertIn("11ff0a1a01000000000000000000000000000000", out)
         self.assertEqual(self.devices[0][0].writes, [])
 
+    def test_edge_waits_for_a_fresh_approach_then_switches_both_devices(self):
+        for side, edge in (("left", -100), ("right", 99)):
+            with self.subTest(side=side):
+                self.install([fake_entry(0), fake_entry(1)])
+                inside = (0, -100, 100, False)
+                outside = (edge, -100, 100, False)
+                drag = (edge, -100, 100, True)
+                positions = [outside] * 5 + [inside, drag] + [outside] * 5
+                positions += [inside] + [outside] * 9
+                with patch.object(mx.sys, "platform", "darwin"), \
+                     patch.object(mx, "macos_pointer", return_value=(p for p in positions)), \
+                     patch.object(mx.time, "sleep"):
+                    code, _, _ = self.run_main(["--all", "--edge", side, "2"])
+                self.assertEqual(code, 0)
+                for dev, *_ in self.devices:
+                    self.assertEqual(len(dev.writes), 1)
+                    self.assertEqual(dev.writes[0][4], 1)
+                    self.assertTrue(dev.closed)
+
+    def test_edge_requires_a_destination_channel(self):
+        code, _, err = self.run_main(["--edge", "left", "--info"])
+        self.assertEqual(code, 2)
+        self.assertIn("explicit destination channel", err)
+
+    def test_linux_edge_rejects_wayland_even_when_xwayland_is_available(self):
+        with patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}):
+            with self.assertRaisesRegex(RuntimeError, "needs an X11 session"):
+                next(mx.x11_pointer())
+
     def test_switch_writes_to_primary_only_by_default(self):
         self.install([fake_entry(0), fake_entry(1)])
         code, out, _ = self.run_main(["2"])

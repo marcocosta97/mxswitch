@@ -165,5 +165,12 @@ hidpp_call() {
 }
 check 'firmware queries main entity after bootloader' '12.34.BABCD' "$(firmware_version 0 17 255)"
 
+check 'edge forwards an explicit channel and preserves switch arguments' \
+    "<right><1><--config><$tmp><--all><--name><MX Keys><--dry-run><1>" \
+    "$(watch_edge() { printf '<%s>' "$@"; }
+       main --config "$tmp" --all --edge right --name 'MX Keys' --dry-run 1)"
+check 'edge rejects a missing channel' '2' \
+    "$( (main --edge right --info) >/dev/null 2>&1; printf '%s' "$?")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

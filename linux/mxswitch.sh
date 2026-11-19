@@ -6,6 +6,7 @@
 #   ./mxswitch.sh --status    --info plus battery and firmware
 #   ./mxswitch.sh 2           switch to channel 2
 #   ./mxswitch.sh --all 2     switch every ChangeHost device
+#   ./mxswitch.sh --all --edge left 2  watch an X11 desktop edge (Python 3 + libX11)
 #   ./mxswitch.sh --toggle    switch to the other configured channel
 #   ./mxswitch.sh --list      list candidate hidraw nodes
 #
@@ -415,11 +416,33 @@ json_escape() {
 
 usage() {
     echo "usage: $0 {1|2|3|--info|--status|--toggle|--list} [--all] [--name SUBSTR] [--dry-run] [--json] [--verbose] [--config PATH]" >&2
+    echo "       $0 {1|2|3} --edge {left|right} [--all] [--name SUBSTR] [--dry-run] [--verbose] [--config PATH]" >&2
+}
+
+watch_edge() {
+    local side=$1 channel=$2 script helper
+    shift 2
+    script=$(readlink -f -- "${BASH_SOURCE[0]}") || return 1
+    helper=${script%/*}/../python/mxswitch.py
+    if [ ! -r "$helper" ]; then helper=${script%/*}/mxswitch.py; fi
+    if [ ! -r "$helper" ] || ! command -v python3 >/dev/null 2>&1; then
+        echo 'Edge mode needs Python 3 and python/mxswitch.py from the checkout (or mxswitch.py next to this script).' >&2
+        return 1
+    fi
+    exec python3 -c '
+import runpy
+import subprocess
+import sys
+
+helper, side, channel, *command = sys.argv[1:]
+watch_edge = runpy.run_path(helper)["watch_edge"]
+sys.exit(watch_edge(side, channel, lambda: subprocess.run(command)))
+' "$helper" "$side" "$channel" bash "$script" "$@"
 }
 
 main() {
-    local mode="" channel="" mode_count=0 want_all=0 dry=0 json=0 verbose=0 config=""
-    local -a want_name=()
+    local mode="" channel="" mode_count=0 want_all=0 dry=0 json=0 verbose=0 config="" edge=""
+    local -a want_name=() switch_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --info)    mode="info"; mode_count=$((mode_count+1)) ;;
@@ -427,22 +450,29 @@ main() {
             --toggle)  mode="toggle"; mode_count=$((mode_count+1)) ;;
             --list)    mode="list"; mode_count=$((mode_count+1)) ;;
             --all)     want_all=1 ;;
-            --name)    shift; want_name+=("${1:-}")
+            --name)    switch_args+=("$1"); shift; want_name+=("${1:-}")
                        [ -n "${1:-}" ] || { usage; exit 2; } ;;
             --dry-run) dry=1 ;;
             --json)    json=1 ;;
             --verbose) verbose=1 ;;
-            --config)  shift; config=${1:-}
+            --config)  switch_args+=("$1"); shift; config=${1:-}
                        [ -n "$config" ] || { usage; exit 2; } ;;
+            --edge)    [ -z "$edge" ] || { usage; exit 2; }
+                       case "${2:-}" in left|right) edge=$2 ;; *) usage; exit 2 ;; esac
+                       shift 2; continue ;;
             -h|--help) usage; exit 0 ;;
             1|2|3)     [ -z "$channel" ] || { usage; exit 2; }; channel=$1 ;;
             *) usage; exit 2 ;;
         esac
+        switch_args+=("$1")
         shift
     done
 
     if [ "$mode_count" -gt 1 ] || { [ "$mode_count" -gt 0 ] && [ -n "$channel" ]; }; then
         echo 'Give exactly one channel or mode (--info, --status, --toggle, --list).' >&2; exit 2
+    fi
+    if [ -n "$edge" ] && [ -z "$channel" ]; then
+        echo '--edge requires an explicit destination channel (1, 2 or 3).' >&2; exit 2
     fi
     if [ "$mode" = "list" ]; then
         local node
@@ -459,6 +489,10 @@ main() {
     config_load "$config" || exit 2
     local problems; problems=$(config_problems)
     if [ -n "$problems" ]; then echo "Invalid config $config: $problems" >&2; exit 2; fi
+    if [ -n "$edge" ]; then
+        watch_edge "$edge" "$channel" "${switch_args[@]}"
+        exit $?
+    fi
     VERBOSE=$verbose
     [ "$CONFIG_DEVICE" = "all" ] && want_all=1
 

@@ -14,6 +14,7 @@ equivalent always-present C API to lean on.
     python mxswitch.py --status      # --info plus battery
     python mxswitch.py 2             # switch to channel 2
     python mxswitch.py --all 2       # switch every ChangeHost device
+    python mxswitch.py --all --edge left 2  # switch on approach to the desktop edge
     python mxswitch.py 2 --name Keys  # only devices whose name contains "Keys"
     python mxswitch.py --toggle      # switch to the other configured channel
     python mxswitch.py --list        # dump candidate HID interfaces
@@ -22,11 +23,14 @@ Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 partial --all failure.
 """
 
 import argparse
+import ctypes
 import json
 import os
 import re
 import sys
 import time
+from contextlib import closing
+from itertools import chain
 from pathlib import Path
 
 LOGITECH_VID = 0x046D
@@ -118,7 +122,6 @@ def name_matches(info, names):
 # ---------------------------------------------------------------------------
 
 if sys.platform == "win32":
-    import ctypes
     from ctypes import wintypes
 
     setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
@@ -695,6 +698,150 @@ def print_human(data):
         print(f"firmware   : {data['firmware']}")
 
 
+def windows_pointer():
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    point = wintypes.POINT()
+    while True:
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            yield None
+            continue
+        left = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        right = left + user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        dragging = any(user32.GetAsyncKeyState(button) < 0 for button in (1, 2, 4))
+        yield point.x, left, right, dragging
+
+
+def macos_pointer():
+    class Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    class Rect(ctypes.Structure):
+        _fields_ = [("origin", Point), ("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+    frameworks = "/System/Library/Frameworks"
+    cg = ctypes.CDLL(f"{frameworks}/CoreGraphics.framework/CoreGraphics")
+    cf = ctypes.CDLL(f"{frameworks}/CoreFoundation.framework/CoreFoundation")
+    cg.CGEventCreate.argtypes = [ctypes.c_void_p]
+    cg.CGEventCreate.restype = ctypes.c_void_p
+    cg.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+    cg.CGEventGetLocation.restype = Point
+    cg.CGGetActiveDisplayList.argtypes = [
+        ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+    ]
+    cg.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+    cg.CGDisplayBounds.restype = Rect
+    cg.CGEventSourceButtonState.argtypes = [ctypes.c_int32, ctypes.c_uint32]
+    cg.CGEventSourceButtonState.restype = ctypes.c_bool
+    cf.CFRelease.argtypes = [ctypes.c_void_p]
+    cf.CFRelease.restype = None
+    displays = (ctypes.c_uint32 * 32)()
+    count = ctypes.c_uint32()
+    while True:
+        if cg.CGGetActiveDisplayList(len(displays), displays, ctypes.byref(count)) or not count.value:
+            yield None
+            continue
+        event = cg.CGEventCreate(None)
+        if not event:
+            yield None
+            continue
+        try:
+            point = cg.CGEventGetLocation(event)
+        finally:
+            cf.CFRelease(event)
+        bounds = [cg.CGDisplayBounds(d) for d in displays[:count.value]]
+        left = min(rect.origin.x for rect in bounds)
+        right = max(rect.origin.x + rect.width for rect in bounds)
+        dragging = any(cg.CGEventSourceButtonState(0, button) for button in (0, 1, 2))
+        yield point.x, left, right, dragging
+
+
+def x11_pointer():
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        raise RuntimeError("edge switching on Linux needs an X11 session")
+    try:
+        x11 = ctypes.CDLL("libX11.so.6")
+    except OSError as exc:
+        raise RuntimeError("edge switching needs libX11") from exc
+
+    display_type = ctypes.c_void_p
+    window_type = ctypes.c_ulong
+    int_pointer = ctypes.POINTER(ctypes.c_int)
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = display_type
+    x11.XCloseDisplay.argtypes = [display_type]
+    x11.XDefaultScreen.argtypes = [display_type]
+    x11.XRootWindow.argtypes = [display_type, ctypes.c_int]
+    x11.XRootWindow.restype = window_type
+    x11.XQueryPointer.argtypes = [
+        display_type, window_type, ctypes.POINTER(window_type), ctypes.POINTER(window_type),
+        int_pointer, int_pointer, int_pointer, int_pointer, ctypes.POINTER(ctypes.c_uint),
+    ]
+    x11.XGetGeometry.argtypes = [
+        display_type, window_type, ctypes.POINTER(window_type), int_pointer, int_pointer,
+        *([ctypes.POINTER(ctypes.c_uint)] * 4),
+    ]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        raise RuntimeError("cannot connect to the X11 display")
+    try:
+        root = x11.XRootWindow(display, x11.XDefaultScreen(display))
+        root_out, child = window_type(), window_type()
+        x, y, win_x, win_y = (ctypes.c_int() for _ in range(4))
+        mask, width, height, border, depth = (ctypes.c_uint() for _ in range(5))
+        while True:
+            if not x11.XGetGeometry(
+                display, root, ctypes.byref(root_out), ctypes.byref(win_x), ctypes.byref(win_y),
+                ctypes.byref(width), ctypes.byref(height), ctypes.byref(border), ctypes.byref(depth),
+            ) or not x11.XQueryPointer(
+                display, root, ctypes.byref(root_out), ctypes.byref(child), ctypes.byref(x),
+                ctypes.byref(y), ctypes.byref(win_x), ctypes.byref(win_y), ctypes.byref(mask),
+            ):
+                yield None
+                continue
+            # X Button1Mask through Button3Mask. Button4/5 are wheel events.
+            yield x.value, 0, width.value, bool(mask.value & 0x700)
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def watch_edge(side, channel, switch):
+    pointer = {"win32": windows_pointer, "darwin": macos_pointer, "linux": x11_pointer}
+    if sys.platform not in pointer:
+        print("Edge switching is unavailable on this platform.", file=sys.stderr)
+        return 2
+    samples = 0
+    try:
+        with closing(pointer[sys.platform]()) as positions:
+            first = next(positions)
+            print(f"Watching the {side} edge for channel {channel}. Press Ctrl+C to stop.", flush=True)
+            for position in chain((first,), positions):
+                if position is None:
+                    samples = 0
+                else:
+                    x, left, right, dragging = position
+                    distance = x - left if side == "left" else right - x
+                    if dragging or not left <= x < right:
+                        samples = 0
+                    elif distance >= 12 or (samples and distance > 1):
+                        samples = 1
+                    elif samples:
+                        samples += 1
+                        if samples == 5:
+                            samples = 0
+                            switch()
+                            sys.stdout.flush()
+                time.sleep(0.05)
+    except (OSError, RuntimeError) as exc:
+        print(f"Edge switching failed: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message):
         self.print_usage(sys.stderr)
@@ -716,6 +863,8 @@ def main():
                     help="only devices whose product name contains SUBSTR (repeatable)")
     ap.add_argument("--toggle", action="store_true",
                     help="switch to the other channel in the configured pair")
+    ap.add_argument("--edge", choices=("left", "right"),
+                    help="watch the desktop edge and switch to the given channel")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the frames that would be sent, without sending")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -727,6 +876,8 @@ def main():
 
     if sum(bool(m) for m in (args.list, args.info, args.status, args.toggle, args.channel is not None)) > 1:
         ap.error("give exactly one channel or mode (--info, --status, --toggle, --list)")
+    if args.edge and args.channel not in (1, 2, 3):
+        ap.error("--edge requires an explicit destination channel (1, 2 or 3)")
 
     if args.list:
         for i in enumerate_interfaces():
@@ -754,6 +905,12 @@ def main():
         print(f"config     : {args.config or config_path()}", file=sys.stderr)
 
     names = list(args.name or []) + list(cfg.get("name") or [])
+    if args.edge:
+        return watch_edge(args.edge, args.channel, lambda: execute_command(args, cfg, want_all, names))
+    return execute_command(args, cfg, want_all, names)
+
+
+def execute_command(args, cfg, want_all, names):
     devices = list(iter_devices(want_all, names, verbose=args.verbose))
     if not devices:
         print("No Logitech device supporting ChangeHost found.", file=sys.stderr)

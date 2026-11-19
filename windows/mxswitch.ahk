@@ -2,7 +2,7 @@
 #SingleInstance Force
 
 ; ---------------------------------------------------------------------------
-; Edit this line.
+; Set SCRIPT to the switcher you use.
 ;   SCRIPT : full path to windows\mxswitch.ps1 (preferred) or python\mxswitch.py
 ;
 ; The host channels come from the mxswitch config file, so the toggle hotkey
@@ -12,20 +12,31 @@
 ; ---------------------------------------------------------------------------
 SCRIPT := "C:\Path\To\mxswitch\windows\mxswitch.ps1"
 
+; Start edge switching by setting EDGE to "left" or "right".
+EDGE := ""
+EDGE_CHANNEL := 1
+if (EDGE != "") {
+    if (!(EDGE = "left" || EDGE = "right") || EDGE_CHANNEL < 1 || EDGE_CHANNEL > 3
+        || !IsInteger(EDGE_CHANNEL))
+        throw ValueError("Use left/right and a destination channel from 1 to 3.")
+    CoordMode "Mouse", "Screen"
+    SetTimer WatchEdge, 50
+}
+
 ; True if SCRIPT ends in .ps1 (PowerShell), otherwise assume Python.
 IsPowerShell() {
     global SCRIPT
     return StrLower(SubStr(SCRIPT, -4)) = ".ps1"
 }
 
-; Run mxswitch with the given arguments. PowerShell gets -Name switches,
-; Python gets --name flags.
-RunMx(argName, value := "") {
+RunMx(argName, value := "", allDevices := false, wait := false) {
     global SCRIPT
     if (IsPowerShell()) {
         args := value = "" ? "-" argName : "-" argName " " value
-        Run(Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" {2}',
-            SCRIPT, args), , "Hide")
+        if allDevices
+            args .= " -All"
+        command := Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" {2}',
+            SCRIPT, args)
     } else {
         ; Python takes the channel as a positional argument; the rest are flags
         ; (--toggle, ...). Passing --channel is not accepted by mxswitch.py.
@@ -37,7 +48,33 @@ RunMx(argName, value := "") {
             args := "--" StrLower(argName) " " value
         }
         ; Use pythonw.exe so no console window flashes.
-        Run(Format('pythonw.exe "{1}" {2}', SCRIPT, args), , "Hide")
+        if allDevices
+            args .= " --all"
+        command := Format('pythonw.exe "{1}" {2}', SCRIPT, args)
+    }
+    if wait
+        RunWait command, , "Hide"
+    else
+        Run command, , "Hide"
+}
+
+WatchEdge() {
+    global EDGE, EDGE_CHANNEL
+    static samples := 0
+    MouseGetPos &x
+    left := SysGet(76)  ; SM_XVIRTUALSCREEN
+    right := left + SysGet(78)  ; SM_CXVIRTUALSCREEN
+    distance := EDGE = "left" ? x - left : right - x
+    dragging := GetKeyState("LButton") || GetKeyState("RButton") || GetKeyState("MButton")
+
+    ; The cursor can stay at the edge while the mouse is on the other host.
+    if (dragging || x < left || x >= right)
+        samples := 0
+    else if (distance >= 12 || (samples && distance > 1))
+        samples := 1
+    else if (samples && ++samples = 5) {
+        samples := 0
+        RunMx("Channel", EDGE_CHANNEL, true, true)
     }
 }
 
