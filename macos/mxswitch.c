@@ -825,18 +825,29 @@ static bool edge_crossed(int *samples, double distance, bool blocked) {
 
 #ifndef MXSWITCH_TEST
 
+static CGRect desktop_bounds(void) {
+    CGDirectDisplayID displays[32];
+    uint32_t count = 0;
+    CGRect bounds = CGRectNull;
+    if (CGGetActiveDisplayList(32, displays, &count) == kCGErrorSuccess) {
+        for (uint32_t i = 0; i < count; i++)
+            bounds = CGRectUnion(bounds, CGDisplayBounds(displays[i]));
+    }
+    return bounds;
+}
+
 static void wait_for_edge(int edge) {
-    // Require an approach from inside the desktop, including after each switch.
     int samples = 0;
-    for (;;) {
-        CGDirectDisplayID displays[32];
-        uint32_t count = 0;
+    CGRect bounds = CGRectNull;
+    for (unsigned tick = 0; ; tick = (tick + 1) % 20) {
+        if (tick == 0) {
+            CGRect current = desktop_bounds();
+            if (!CGRectEqualToRect(bounds, current)) samples = 0;
+            bounds = current;
+        }
         CGEventRef event = CGEventCreate(NULL);
         double distance = -1;
-        if (event && CGGetActiveDisplayList(32, displays, &count) == kCGErrorSuccess && count) {
-            CGRect bounds = CGRectNull;
-            for (uint32_t i = 0; i < count; i++)
-                bounds = CGRectUnion(bounds, CGDisplayBounds(displays[i]));
+        if (event && !CGRectIsNull(bounds)) {
             CGPoint point = CGEventGetLocation(event);
             distance = edge < 0 ? point.x - CGRectGetMinX(bounds)
                                 : CGRectGetMaxX(bounds) - point.x;
@@ -845,7 +856,12 @@ static void wait_for_edge(int edge) {
         bool dragging = CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft) ||
                         CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonRight) ||
                         CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonCenter);
-        if (edge_crossed(&samples, distance, dragging)) return;
+        if (edge_crossed(&samples, distance, dragging)) {
+            // The saved edge may have moved since the last refresh.
+            CGRect current = desktop_bounds();
+            if (CGRectEqualToRect(bounds, current)) return;
+            bounds = current;
+        }
         usleep(50000);
     }
 }

@@ -240,6 +240,30 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("explicit destination channel", err)
 
+    def test_edge_rechecks_geometry_before_switching(self):
+        self.install([fake_entry(0), fake_entry(1)])
+        old_edge = (99, 0, 100, False)
+        new_interior = (99, 0, 200, False)
+        new_edge = (199, 0, 200, False)
+        positions = [(50, 0, 100, False), *([old_edge] * 4), new_interior,
+                     new_interior, *([new_edge] * 5)]
+        requests = []
+
+        def pointer():
+            for position in positions:
+                if (yield position):
+                    requests.append(position)
+                    if position == old_edge:
+                        self.assertFalse(self.devices[0][0].writes)
+
+        with patch.object(mx.sys, "platform", "darwin"), \
+             patch.object(mx, "macos_pointer", side_effect=pointer), \
+             patch.object(mx.time, "sleep"):
+            code, _, _ = self.run_main(["--all", "--edge", "right", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(requests, [old_edge, new_edge])
+        self.assertEqual([len(dev.writes) for dev, *_ in self.devices], [1, 1])
+
     def test_linux_edge_rejects_wayland_even_when_xwayland_is_available(self):
         with patch.dict(os.environ, {"XDG_SESSION_TYPE": "wayland", "DISPLAY": ":0"}):
             with self.assertRaisesRegex(RuntimeError, "needs an X11 session"):

@@ -742,23 +742,30 @@ def macos_pointer():
     cf.CFRelease.restype = None
     displays = (ctypes.c_uint32 * 32)()
     count = ctypes.c_uint32()
+    left = right = refresh_at = 0
+    refresh = False
     while True:
-        if cg.CGGetActiveDisplayList(len(displays), displays, ctypes.byref(count)) or not count.value:
-            yield None
+        now = time.monotonic()
+        if refresh or now >= refresh_at:
+            refresh_at = now + 1
+            left = right = 0
+            if not cg.CGGetActiveDisplayList(len(displays), displays, ctypes.byref(count)) and count.value:
+                bounds = [cg.CGDisplayBounds(d) for d in displays[:count.value]]
+                left = min(rect.origin.x for rect in bounds)
+                right = max(rect.origin.x + rect.width for rect in bounds)
+        if left >= right:
+            refresh = yield None
             continue
         event = cg.CGEventCreate(None)
         if not event:
-            yield None
+            refresh = yield None
             continue
         try:
             point = cg.CGEventGetLocation(event)
         finally:
             cf.CFRelease(event)
-        bounds = [cg.CGDisplayBounds(d) for d in displays[:count.value]]
-        left = min(rect.origin.x for rect in bounds)
-        right = max(rect.origin.x + rect.width for rect in bounds)
         dragging = any(cg.CGEventSourceButtonState(0, button) for button in (0, 1, 2))
-        yield point.x, left, right, dragging
+        refresh = yield point.x, left, right, dragging
 
 
 def x11_pointer():
@@ -794,18 +801,25 @@ def x11_pointer():
         root_out, child = window_type(), window_type()
         x, y, win_x, win_y = (ctypes.c_int() for _ in range(4))
         mask, width, height, border, depth = (ctypes.c_uint() for _ in range(5))
+        refresh_at = 0
+        refresh = False
         while True:
-            if not x11.XGetGeometry(
-                display, root, ctypes.byref(root_out), ctypes.byref(win_x), ctypes.byref(win_y),
-                ctypes.byref(width), ctypes.byref(height), ctypes.byref(border), ctypes.byref(depth),
-            ) or not x11.XQueryPointer(
+            now = time.monotonic()
+            if refresh or now >= refresh_at:
+                refresh_at = now + 1
+                if not x11.XGetGeometry(
+                    display, root, ctypes.byref(root_out), ctypes.byref(win_x), ctypes.byref(win_y),
+                    ctypes.byref(width), ctypes.byref(height), ctypes.byref(border), ctypes.byref(depth),
+                ):
+                    width.value = 0
+            if not width.value or not x11.XQueryPointer(
                 display, root, ctypes.byref(root_out), ctypes.byref(child), ctypes.byref(x),
                 ctypes.byref(y), ctypes.byref(win_x), ctypes.byref(win_y), ctypes.byref(mask),
             ):
-                yield None
+                refresh = yield None
                 continue
             # X Button1Mask through Button3Mask. Button4/5 are wheel events.
-            yield x.value, 0, width.value, bool(mask.value & 0x700)
+            refresh = yield x.value, 0, width.value, bool(mask.value & 0x700)
     finally:
         x11.XCloseDisplay(display)
 
@@ -816,6 +830,7 @@ def watch_edge(side, channel, switch):
         print("Edge switching is unavailable on this platform.", file=sys.stderr)
         return 2
     samples = 0
+    bounds = None
     try:
         with closing(pointer[sys.platform]()) as positions:
             first = next(positions)
@@ -825,6 +840,9 @@ def watch_edge(side, channel, switch):
                     samples = 0
                 else:
                     x, left, right, dragging = position
+                    if bounds != (left, right):
+                        samples = 0
+                        bounds = (left, right)
                     distance = x - left if side == "left" else right - x
                     if dragging or not left <= x < right:
                         samples = 0
@@ -834,14 +852,22 @@ def watch_edge(side, channel, switch):
                         samples += 1
                         if samples == 5:
                             samples = 0
-                            switch()
-                            sys.stdout.flush()
+                            # Confirm the cached edge still exists before handing off the devices.
+                            fresh = positions.send(True)
+                            if fresh and fresh[1:3] == bounds and not fresh[3]:
+                                x = fresh[0]
+                                distance = x - left if side == "left" else right - x
+                                if left <= x < right and distance <= 1:
+                                    switch()
+                                    sys.stdout.flush()
                 time.sleep(0.05)
     except (OSError, RuntimeError) as exc:
         print(f"Edge switching failed: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130
+    except StopIteration:
+        return 0
     return 0
 
 
