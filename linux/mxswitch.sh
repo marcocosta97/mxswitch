@@ -54,9 +54,7 @@ hidpp_build_frame() {
     local p; for p in "$@"; do frame+=( "$(( p ))" ); done
     [ "${#frame[@]}" -le "$len" ] || return 1
     while [ "${#frame[@]}" -lt "$len" ]; do frame+=( 0 ); done
-    local out="" b
-    for b in "${frame[@]}"; do out+=$(printf '%02x' "$b"); done
-    printf '%s' "$out"
+    printf '%02x' "${frame[@]}"
 }
 
 # hidpp_classify_reply <reply_hex> <dev_idx> <feature_idx>
@@ -231,7 +229,7 @@ device_metadata() {
     fi
 }
 
-DEV_NODES=(); DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
+DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
 META_NAME="" META_FILTER_NAME="" META_KEY=""
 
 # Close each shared transport once. With keep set, retain the primary transport.
@@ -254,7 +252,7 @@ device_name_rank() {
 find_device() {
     local want_all=${1:-0}
     [ "$#" -gt 0 ] && shift
-    DEV_NODES=(); DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
+    DEV_FDS=(); DEV_RIDS=(); DEV_DIDX=(); DEV_FIDX=(); DEV_NAMES=()
     local node rid didx reply fidx name fd matched retained identity key duplicate preferred rank
     local -a seen=() ranks=()
     for node in $(logitech_hidraws); do
@@ -278,7 +276,7 @@ find_device() {
             for key in ${seen[@]+"${seen[@]}"}; do [ "$key" = "$META_KEY" ] && duplicate=1; done
             if [ "$duplicate" -eq 0 ] && name_matches "$META_FILTER_NAME" "$@"; then
                 seen+=("$META_KEY"); retained=1
-                DEV_NODES+=("$node"); DEV_FDS+=("$fd"); DEV_RIDS+=("$rid")
+                DEV_FDS+=("$fd"); DEV_RIDS+=("$rid")
                 DEV_DIDX+=("$didx"); DEV_FIDX+=("$fidx"); DEV_NAMES+=("$META_NAME")
                 rank=$(device_name_rank "$META_NAME"); ranks+=("$rank")
                 if [ "$want_all" -eq 0 ] && [ "$rank" -eq 0 ]; then preferred=1; break; fi
@@ -292,7 +290,6 @@ find_device() {
     for (( i=1; i<${#DEV_FDS[@]}; i++ )); do
         for (( j=i; j>0 && ranks[j]<ranks[j-1]; j-- )); do
             tmp=${ranks[j]}; ranks[j]=${ranks[j-1]}; ranks[j-1]=$tmp
-            tmp=${DEV_NODES[j]}; DEV_NODES[j]=${DEV_NODES[j-1]}; DEV_NODES[j-1]=$tmp
             tmp=${DEV_FDS[j]}; DEV_FDS[j]=${DEV_FDS[j-1]}; DEV_FDS[j-1]=$tmp
             tmp=${DEV_RIDS[j]}; DEV_RIDS[j]=${DEV_RIDS[j-1]}; DEV_RIDS[j-1]=$tmp
             tmp=${DEV_DIDX[j]}; DEV_DIDX[j]=${DEV_DIDX[j-1]}; DEV_DIDX[j-1]=$tmp
@@ -303,7 +300,7 @@ find_device() {
     [ "${#DEV_FDS[@]}" -gt 0 ] || return 1
     if [ "$want_all" -eq 0 ]; then
         close_devices "${DEV_FDS[0]}"
-        DEV_NODES=("${DEV_NODES[0]}"); DEV_FDS=("${DEV_FDS[0]}"); DEV_RIDS=("${DEV_RIDS[0]}")
+        DEV_FDS=("${DEV_FDS[0]}"); DEV_RIDS=("${DEV_RIDS[0]}")
         DEV_DIDX=("${DEV_DIDX[0]}"); DEV_FIDX=("${DEV_FIDX[0]}"); DEV_NAMES=("${DEV_NAMES[0]}")
     fi
 }
