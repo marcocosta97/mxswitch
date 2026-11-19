@@ -14,7 +14,7 @@
  *     ./mxswitch --all 2
  *     ./mxswitch --edge left --all 2
  *     ./mxswitch --toggle
- *     ./mxswitch --setup              # open Input Monitoring settings if needed
+ *     ./mxswitch --setup              # open Input Monitoring settings
  *
  * Needs Input Monitoring (System Settings > Privacy & Security). Grant it to
  * this binary, and to whatever launches it (BetterTouchTool, Raycast, ...).
@@ -27,20 +27,14 @@
 #include <IOKit/hid/IOHIDManager.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <mach-o/dyld.h>
-#include <spawn.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/wait.h>
 #include <unistd.h>
-
-extern char **environ;
 
 #define LOGITECH_VID      0x046D
 #define SW_ID             0x0A
@@ -661,127 +655,13 @@ static void print_json(const device_info_t *di, const status_t *st, int last) {
 /* ------------------------------------------------------------------ */
 /* Input Monitoring setup (macOS onboarding)                           */
 
-#define TCC_SYSTEM_DB "/Library/Application Support/com.apple.TCC/TCC.db"
 #define INPUT_MONITORING_SETTINGS \
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
 
-/* Resolve this binary's real path for TCC client matching. */
-static int own_executable_path(char *out, size_t out_sz) {
-    char raw[PATH_MAX];
-    char resolved[PATH_MAX];
-    uint32_t size = sizeof(raw);
-    if (_NSGetExecutablePath(raw, &size) != 0) return 0;
-    const char *path = realpath(raw, resolved) ? resolved : raw;
-    if (snprintf(out, out_sz, "%s", path) >= (int)out_sz) return 0;
-    return 1;
-}
-
-/*
- * Run `/usr/bin/sqlite3 <db> <query>` without a shell, so a path embedded in
- * the query can never be reinterpreted as shell input. Reads at most out_sz-1
- * bytes of stdout. Returns the bytes read, or -1 if the process could not run
- * or exited non-zero (e.g. the DB is TCC-protected).
- */
-static int spawn_sqlite(const char *db, const char *query,
-                        char *out, size_t out_sz) {
-    int pfd[2];
-    if (pipe(pfd) != 0) return -1;
-
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&fa, pfd[1], STDOUT_FILENO);
-    posix_spawn_file_actions_addclose(&fa, pfd[0]);
-    posix_spawn_file_actions_addclose(&fa, pfd[1]);
-
-    char *argv[] = { (char *)"/usr/bin/sqlite3", (char *)db,
-                     (char *)query, NULL };
-    pid_t pid;
-    int rc = posix_spawn(&pid, "/usr/bin/sqlite3", &fa, NULL, argv, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    close(pfd[1]);
-    if (rc != 0) {
-        close(pfd[0]);
-        return -1;
-    }
-
-    size_t total = 0;
-    for (;;) {
-        ssize_t n = read(pfd[0], out + total, out_sz - 1 - total);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
-        total += (size_t)n;
-        if (total >= out_sz - 1) break;
-    }
-    out[total] = '\0';
-    close(pfd[0]);
-
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) return -1;
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
-    return (int)total;
-}
-
-/*
- * Is Input Monitoring already granted to *this* binary?
- * CGPreflightListenEventAccess() is not enough on its own: a Terminal that
- * already has the grant makes it return true for any child. Prefer the TCC
- * database row keyed by executable path; fall back to preflight only if the
- * DB is unreadable.
- *
- * Returns 1 = granted, 0 = not granted, -1 = unknown.
- */
-static int input_monitoring_granted(void) {
-    char exe[PATH_MAX];
-    if (!own_executable_path(exe, sizeof(exe)))
-        return CGPreflightListenEventAccess() ? 1 : 0;
-
-    /* Double single quotes for the SQL string literal. */
-    char esc[PATH_MAX * 2];
-    size_t j = 0;
-    for (size_t i = 0; exe[i] && j + 2 < sizeof(esc); i++) {
-        if (exe[i] == '\'') {
-            esc[j++] = '\'';
-            esc[j++] = '\'';
-        } else {
-            esc[j++] = exe[i];
-        }
-    }
-    esc[j] = '\0';
-
-    char query[PATH_MAX * 2 + 128];
-    snprintf(query, sizeof(query),
-             "SELECT auth_value FROM access WHERE "
-             "service='kTCCServiceListenEvent' AND client='%s' LIMIT 1;", esc);
-
-    char line[32];
-    int n = spawn_sqlite(TCC_SYSTEM_DB, query, line, sizeof(line));
-    if (n < 0)
-        /* DB unreadable (SIP / TCC protection). Fall back. */
-        return CGPreflightListenEventAccess() ? 1 : 0;
-    if (n == 0)
-        /* No row for this path — not granted (or never prompted). */
-        return 0;
-    /* auth_value 2 = allowed. 0 = denied. */
-    return atoi(line) == 2 ? 1 : 0;
-}
-
-/* Open Input Monitoring settings unless this binary is already allowed. */
 static int setup_input_monitoring(void) {
-    int granted = input_monitoring_granted();
-    if (granted == 1) {
-        printf("Input Monitoring already granted for this binary.\n");
-        return 0;
-    }
-
     printf("Opening System Settings → Privacy & Security → Input Monitoring\n");
     printf("Enable mxswitch (use + to add it if it is not listed).\n");
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "/usr/bin/open '%s'", INPUT_MONITORING_SETTINGS);
-    if (system(cmd) != 0) {
+    if (system("/usr/bin/open '" INPUT_MONITORING_SETTINGS "'") != 0) {
         fprintf(stderr, "Could not open System Settings. Enable Input Monitoring "
                         "manually under Privacy & Security.\n");
         return 1;

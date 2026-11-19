@@ -31,7 +31,7 @@ install: mxswitch
 	install -m 755 mxswitch $(PREFIX)/bin/mxswitch
 	@echo
 	@echo "Installed to $(PREFIX)/bin/mxswitch"
-	@# Prompt for Input Monitoring only when this binary is not already allowed.
+	@# Open Input Monitoring settings for the installed binary.
 	@# Under sudo make install, run as the invoking user so TCC/Settings apply
 	@# to them rather than root.
 	@if [ -n "$$SUDO_USER" ]; then \
