@@ -2,15 +2,15 @@
 #SingleInstance Force
 
 ; ---------------------------------------------------------------------------
-; Set SCRIPT to the switcher you use.
-;   SCRIPT : full path to windows\mxswitch.ps1 (preferred) or python\mxswitch.py
+; By default, use mxswitch.ps1 next to this file. Set SCRIPT to an absolute
+; path if your PowerShell or Python switcher is elsewhere.
 ;
 ; The host channels come from the mxswitch config file, so the toggle hotkey
 ; switches to whichever channel is not currently active:
 ;     Windows  %LOCALAPPDATA%\mxswitch\config
 ;     others   ~/.config/mxswitch/config      (channel_a=1, channel_b=2)
 ; ---------------------------------------------------------------------------
-SCRIPT := "C:\Path\To\mxswitch\windows\mxswitch.ps1"
+SCRIPT := A_ScriptDir "\mxswitch.ps1"
 
 ; Start edge switching by setting EDGE to "left" or "right".
 EDGE := ""
@@ -19,8 +19,15 @@ if (EDGE != "") {
     if (!(EDGE = "left" || EDGE = "right") || EDGE_CHANNEL < 1 || EDGE_CHANNEL > 3
         || !IsInteger(EDGE_CHANNEL))
         throw ValueError("Use left/right and a destination channel from 1 to 3.")
+    CheckScriptPath()
     CoordMode "Mouse", "Screen"
     SetTimer WatchEdge, 50
+}
+
+CheckScriptPath() {
+    global SCRIPT
+    if !FileExist(SCRIPT)
+        throw Error("mxswitch script not found. Check SCRIPT in mxswitch.ahk.", -1, SCRIPT)
 }
 
 ; True if SCRIPT ends in .ps1 (PowerShell), otherwise assume Python.
@@ -31,6 +38,7 @@ IsPowerShell() {
 
 RunMx(argName, value := "", allDevices := false, wait := false) {
     global SCRIPT
+    CheckScriptPath()
     if (IsPowerShell()) {
         args := value = "" ? "-" argName : "-" argName " " value
         if allDevices
@@ -52,10 +60,15 @@ RunMx(argName, value := "", allDevices := false, wait := false) {
             args .= " --all"
         command := Format('pythonw.exe "{1}" {2}', SCRIPT, args)
     }
-    if wait
-        RunWait command, , "Hide"
-    else
+    if wait {
+        exitCode := RunWait(command, , "Hide")
+        if exitCode != 0
+            MsgBox(Format("mxswitch exited with code {1}. Run this command in a terminal:`n`n{2}",
+                exitCode, command), "mxswitch")
+        return exitCode = 0
+    } else {
         Run command, , "Hide"
+    }
 }
 
 WatchEdge() {
@@ -83,9 +96,8 @@ WatchEdge() {
 
 ; Ctrl+Alt+Shift+M  ->  hand it over and lock this machine behind you
 ^!+m:: {
-    RunMx("Toggle")
-    Sleep 500                                ; let the frame go out first
-    DllCall("user32\LockWorkStation")
+    if RunMx("Toggle", "", false, true)
+        DllCall("user32\LockWorkStation")
 }
 
 ; Explicit channels, in case you ever pair a third host
