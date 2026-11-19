@@ -12,6 +12,7 @@
     .\mxswitch.ps1 -Status
     .\mxswitch.ps1 -Channel 2
     .\mxswitch.ps1 -All -Channel 2
+    .\mxswitch.ps1 -All -Channel 1 -Edge Right
     .\mxswitch.ps1 -Toggle
 
 .NOTES
@@ -46,7 +47,10 @@ param(
     [string[]]$Name,
 
     # Skip the cached device paths and force a full rescan.
-    [switch]$NoCache
+    [switch]$NoCache,
+
+    [ValidateSet('Left', 'Right')]
+    [string]$Edge
 )
 
 $ErrorActionPreference = 'Stop'
@@ -154,7 +158,7 @@ function Format-MxHex {
 
 # Device enumeration and the C# helper are only needed when the script actually
 # runs; keeping them behind this guard lets tests dot-source the pure helpers.
-if (-not $env:MXSWITCH_TEST) {
+if (-not $env:MXSWITCH_TEST -and -not ('Hid' -as [type])) {
 
 Add-Type -TypeDefinition @'
 using System;
@@ -163,6 +167,44 @@ using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 using System.IO;
 using System.Threading.Tasks;
+
+public static class MxEdge {
+    [StructLayout(LayoutKind.Sequential)]
+    struct POINT { public int x, y; }
+
+    [DllImport("user32.dll")]
+    static extern bool GetCursorPos(out POINT point);
+    [DllImport("user32.dll")]
+    static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll")]
+    static extern short GetAsyncKeyState(int key);
+
+    public static bool Advance(ref int samples, int distance, bool blocked) {
+        if (blocked || distance < 0) samples = 0;
+        else if (distance >= 12) samples = 1;
+        else if (samples != 0 && distance > 1) samples = 1;
+        else if (samples != 0 && ++samples == 5) {
+            samples = 0;
+            return true;
+        }
+        return false;
+    }
+
+    public static bool Poll(bool rightEdge, ref int samples) {
+        const int SM_XVIRTUALSCREEN = 76, SM_CXVIRTUALSCREEN = 78;
+        const int VK_LBUTTON = 1, VK_RBUTTON = 2, VK_MBUTTON = 4;
+        POINT point;
+        if (!GetCursorPos(out point)) return Advance(ref samples, -1, false);
+        int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int right = left + GetSystemMetrics(SM_CXVIRTUALSCREEN) - 1;
+        int distance = point.x < left || point.x > right ? -1 :
+                       (rightEdge ? right - point.x : point.x - left);
+        bool dragging = GetAsyncKeyState(VK_LBUTTON) < 0 ||
+                        GetAsyncKeyState(VK_RBUTTON) < 0 ||
+                        GetAsyncKeyState(VK_MBUTTON) < 0;
+        return Advance(ref samples, distance, dragging);
+    }
+}
 
 public class Hid {
     const int  DIGCF_PRESENT = 0x02, DIGCF_DEVICEINTERFACE = 0x10;
@@ -665,6 +707,27 @@ $modes = @(@($Info, $Status, $List, $Toggle) | Where-Object { $_ })
 if ($modes.Count + [int]$PSBoundParameters.ContainsKey('Channel') -gt 1) {
     Write-MxError '-Info, -Status, -List and -Toggle are mutually exclusive'
     exit 2
+}
+
+if ($Edge) {
+    if ($Channel -notin @(1,2,3)) {
+        Write-MxError '-Edge requires an explicit -Channel 1, 2 or 3.'
+        exit 2
+    }
+    $switchParams = @{}
+    foreach ($key in $PSBoundParameters.Keys) {
+        if ($key -ne 'Edge') { $switchParams[$key] = $PSBoundParameters[$key] }
+    }
+    $rightEdge = $Edge -eq 'Right'
+    $samples = 0
+    "Watching the $Edge edge for channel $Channel. Press Ctrl+C to stop."
+    while ($true) {
+        # Start unarmed so a pointer left at the edge cannot switch back on arrival.
+        if ([MxEdge]::Poll($rightEdge, [ref]$samples)) {
+            & $PSCommandPath @switchParams
+        }
+        Start-Sleep -Milliseconds 50
+    }
 }
 
 if ($List) {

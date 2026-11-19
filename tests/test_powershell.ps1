@@ -71,6 +71,22 @@ AfterAll {
     $env:LOCALAPPDATA = $originalLocalAppData
 }
 
+Describe 'Edge switching' {
+    It 'requires a fresh approach and ignores a drag' {
+        $samples = 0
+        [MxEdge]::Advance([ref]$samples, 0, $false) | Should -Be $false
+        [MxEdge]::Advance([ref]$samples, 12, $false) | Should -Be $false
+        [MxEdge]::Advance([ref]$samples, 0, $true) | Should -Be $false
+        [MxEdge]::Advance([ref]$samples, 0, $false) | Should -Be $false
+        [MxEdge]::Advance([ref]$samples, 12, $false) | Should -Be $false
+        foreach ($sample in 1..3) {
+            [MxEdge]::Advance([ref]$samples, 0, $false) | Should -Be $false
+        }
+        [MxEdge]::Advance([ref]$samples, 0, $false) | Should -Be $true
+        [MxEdge]::Advance([ref]$samples, 0, $false) | Should -Be $false
+    }
+}
+
 Describe 'Shared protocol cases' {
     It 'encodes all shared frames' {
         $fixtures.frames.Count | Should -BeGreaterThan 0

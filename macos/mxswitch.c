@@ -12,6 +12,7 @@
  *     ./mxswitch --status
  *     ./mxswitch 2
  *     ./mxswitch --all 2
+ *     ./mxswitch --edge left --all 2
  *     ./mxswitch --toggle
  *     ./mxswitch --setup              # open Input Monitoring settings if needed
  *
@@ -30,6 +31,7 @@
 #include <limits.h>
 #include <mach-o/dyld.h>
 #include <spawn.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -792,7 +794,7 @@ typedef struct {
     const char *mode;             /* info status list toggle setup, or NULL */
     int mode_count;               /* how many mode flags were given */
     int channel;                  /* 0 = unset */
-    int all, dry, json, verbose;
+    int all, dry, json, verbose, edge; /* -1 left, 1 right */
     const char *config_path;
     const char *names[MAX_NAME_FILTERS];  /* --name substrings, OR'd */
     int name_count;
@@ -802,10 +804,51 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "usage: %s {1|2|3|--info|--status|--toggle|--list|--setup} "
             "[--all] [--name SUBSTR] [--dry-run] [--json] [--verbose] "
-            "[--config PATH]\n", prog);
+            "[--config PATH]\n"
+            "       %s {1|2|3} --edge {left|right} [--all] [--name SUBSTR] "
+            "[--dry-run] [--verbose] [--config PATH]\n", prog, prog);
+}
+
+static bool edge_crossed(int *samples, double distance, bool blocked) {
+    if (blocked || distance < 0) *samples = 0;
+    else if (distance >= 12) *samples = 1;
+    else if (*samples && distance > 1) *samples = 1;
+    else if (*samples && ++*samples == 5) {
+        *samples = 0;
+        return true;
+    }
+    return false;
 }
 
 #ifndef MXSWITCH_TEST
+
+static void wait_for_edge(int edge) {
+    // Require an approach from inside the desktop, including after each switch.
+    int samples = 0;
+    for (;;) {
+        CGDirectDisplayID displays[32];
+        uint32_t count = 0;
+        CGEventRef event = CGEventCreate(NULL);
+        double distance = -1;
+        if (event && CGGetActiveDisplayList(32, displays, &count) == kCGErrorSuccess && count) {
+            CGRect bounds = CGRectNull;
+            for (uint32_t i = 0; i < count; i++)
+                bounds = CGRectUnion(bounds, CGDisplayBounds(displays[i]));
+            CGPoint point = CGEventGetLocation(event);
+            distance = edge < 0 ? point.x - CGRectGetMinX(bounds)
+                                : CGRectGetMaxX(bounds) - point.x;
+        }
+        if (event) CFRelease(event);
+        bool dragging = CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonLeft) ||
+                        CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonRight) ||
+                        CGEventSourceButtonState(kCGEventSourceStateCombinedSessionState, kCGMouseButtonCenter);
+        if (edge_crossed(&samples, distance, dragging)) return;
+        usleep(50000);
+    }
+}
+
+static int execute_command(opts_t o, const char *const *names, int name_count,
+                           const config_t *cfg);
 
 int main(int argc, char **argv) {
     opts_t o = { 0 };
@@ -825,6 +868,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--dry-run")) o.dry = 1;
         else if (!strcmp(a, "--json")) o.json = 1;
         else if (!strcmp(a, "--verbose")) o.verbose = 1;
+        else if (!strcmp(a, "--edge") && !o.edge && i + 1 < argc) {
+            const char *side = argv[++i];
+            if (!strcmp(side, "left")) o.edge = -1;
+            else if (!strcmp(side, "right")) o.edge = 1;
+            else { usage(argv[0]); return 2; }
+        }
         else if (!strcmp(a, "--config") && i + 1 < argc) o.config_path = argv[++i];
         else if (!strcmp(a, "--name") && i + 1 < argc) {
             if (!argv[i+1][0]) { fprintf(stderr, "--name requires a nonempty substring\n"); return 2; }
@@ -837,6 +886,10 @@ int main(int argc, char **argv) {
     if (o.mode_count + (o.channel != 0) > 1) {
         fprintf(stderr, "--info, --status, --toggle, --list and --setup are "
                         "mutually exclusive\n");
+        return 2;
+    }
+    if (o.edge && !o.channel) {
+        fprintf(stderr, "--edge requires an explicit destination channel (1, 2 or 3).\n");
         return 2;
     }
 
@@ -889,6 +942,20 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!o.edge) return execute_command(o, names, name_count, &cfg);
+
+    printf("Watching the %s edge for channel %d. Press Ctrl+C to stop.\n",
+           o.edge < 0 ? "left" : "right", o.channel);
+    fflush(stdout);
+    for (;;) {
+        wait_for_edge(o.edge);
+        execute_command(o, names, name_count, &cfg);
+        fflush(stdout);
+    }
+}
+
+static int execute_command(opts_t o, const char *const *names, int name_count,
+                           const config_t *cfg) {
     device_set_t set;
     int found = find_devices(&set, o.all, o.verbose, names, name_count);
     if (!found) {
@@ -926,12 +993,12 @@ int main(int argc, char **argv) {
             return 1;
         }
         int current = reply[5] + 1;
-        if (current == cfg.channel_a) channel = cfg.channel_b;
-        else if (current == cfg.channel_b) channel = cfg.channel_a;
+        if (current == cfg->channel_a) channel = cfg->channel_b;
+        else if (current == cfg->channel_b) channel = cfg->channel_a;
         else {
             fprintf(stderr, "Current channel %d is not in the configured pair "
                             "%d,%d. Refusing to guess.\n",
-                    current, cfg.channel_a, cfg.channel_b);
+                    current, cfg->channel_a, cfg->channel_b);
             devices_release(&set);
             return 1;
         }

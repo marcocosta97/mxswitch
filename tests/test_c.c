@@ -159,6 +159,22 @@ static void check_discovery(void) {
     CFRelease(fake_devices);
 }
 
+static void check_edge(void) {
+    const struct { double distance; bool blocked, crosses; } cases[] = {
+        {0, false, false}, {12, false, false}, {0, true, false}, {0, false, false},
+        {12, false, false}, {0, false, false}, {0, false, false}, {2, false, false},
+        {0, false, false}, {0, false, false}, {0, false, false}, {0, false, true},
+        {0, false, false},
+    };
+    int samples = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (edge_crossed(&samples, cases[i].distance, cases[i].blocked) != cases[i].crosses) {
+            printf("FAIL: edge trigger at sample %zu\n", i);
+            fails++;
+        }
+    }
+}
+
 int main(void) {
     for (size_t i = 0; i < sizeof(fixture_frames)/sizeof(fixture_frames[0]); i++) {
         const struct fixture_frame *f = &fixture_frames[i];
@@ -186,6 +202,7 @@ int main(void) {
     check_config();
     check_name();
     check_discovery();
+    check_edge();
 
     if (fails) {
         printf("\n%d test(s) failed\n", fails);
