@@ -26,7 +26,8 @@
         channel_b=2
         device=primary|all
 
-    Exit codes: 0 ok, 1 device not found, 2 bad usage, 3 partial -All failure.
+    Exit codes: 0 ok, 1 operation failed, 2 bad usage, 3 partial failure.
+    With -QuietUnconfirmed, exit 4 means an inconclusive switch without a confirmed failure.
 #>
 [CmdletBinding()]
 param(
@@ -48,6 +49,9 @@ param(
 
     # Skip the cached device paths and force a full rescan.
     [switch]$NoCache,
+
+    # Give unattended callers an exit code for inconclusive switches.
+    [switch]$QuietUnconfirmed,
 
     [ValidateSet('Left', 'Right')]
     [string]$Edge
@@ -698,6 +702,7 @@ function Invoke-Switch {
             Frame = New-HidppFrame $ctx.ReportId $ctx.DevIdx $ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
             Switched = $current -and $current.Length -ge 6 -and ($current[5] + 1) -eq $TargetChannel
             Written = $false
+            OtherChannel = $null
         }
     })
     $pending = @($results | Where-Object { -not $_.Switched })
@@ -705,27 +710,32 @@ function Invoke-Switch {
         Write-Verbose "switch attempt $attempt on $($pending.Count) device(s)"
         $wroteAny = $false
         foreach ($result in $pending) {
-            $result.Written = $result.Context.Dev.Write($result.Frame)
-            $wroteAny = $wroteAny -or $result.Written
+            $written = $result.Context.Dev.Write($result.Frame)
+            # A retry may be rejected because the previous write already switched hosts.
+            $result.Written = $result.Written -or $written
+            $wroteAny = $wroteAny -or $written
         }
         # Give every write time to land before checking any device.
         if ($wroteAny) { Start-Sleep -Milliseconds 250 }
 
         $presentPaths = $null
         $pending = @(foreach ($result in $pending) {
-            if ($result.Written) {
+            # One final query can establish the channel even after rejected writes.
+            if ($result.Written -or $attempt -eq $Attempts) {
                 $ctx = $result.Context
                 $outcome = ''
                 $still = Invoke-HidppCall $ctx.Dev $ctx.ReportId $ctx.DevIdx $ctx.FeatureIdx 0 @() 250 ([ref]$outcome)
-                if ($outcome -in @('write-failed', 'read-failed') -and $ctx.DevIdx -eq 255) {
+                if ($result.Written -and $outcome -in @('write-failed', 'read-failed') -and $ctx.DevIdx -eq 255) {
                     if ($null -eq $presentPaths) { $presentPaths = @(Get-MxInterfaces | ForEach-Object Path) }
                     if ($ctx.Iface.Path -notin $presentPaths) { $outcome = 'disconnected' }
                 }
-                if ($outcome -in @('timeout', 'disconnected') -or
-                    ($still -and $still.Length -ge 6 -and ($still[5] + 1) -eq $TargetChannel)) {
+                $channelRead = if ($still -and $still.Length -ge 6 -and $still[5] -lt 3) { $still[5] + 1 }
+                if ($channelRead -eq $TargetChannel -or
+                    ($result.Written -and $outcome -in @('timeout', 'disconnected'))) {
                     $result.Switched = $true
                     continue
                 }
+                if ($attempt -eq $Attempts) { $result.OtherChannel = $channelRead }
                 Write-Verbose "could not verify the switch ($outcome)"
             }
             $result
@@ -737,6 +747,15 @@ function Invoke-Switch {
     $results
 }
 
+function Get-SwitchExitCode {
+    param([object[]]$Results, [switch]$QuietUnconfirmed)
+
+    $pending = @($Results | Where-Object { -not $_.Switched })
+    if ($pending.Count -eq 0) { return 0 }
+    if ($QuietUnconfirmed -and -not ($pending | Where-Object OtherChannel)) { return 4 }
+    if ($pending.Count -eq $Results.Count) { return 1 }
+    return 3
+}
 
 if (-not $env:MXSWITCH_TEST) {
 
@@ -865,8 +884,8 @@ if ($DryRun) {
     process exits here, the handle closes and a report still in flight can be
     lost, which is why a plain write-and-exit succeeds only intermittently.
 
-    So verify by absence. After the switch the device should stop answering; if
-    it still replies to getHostInfo, the frame did not land and we try again.
+    A switch usually stops replies on this host. A device that keeps answering
+    can report its active channel directly.
 #>
 
 "Switching to channel $Channel ..."
@@ -876,20 +895,17 @@ try {
     Close-MxDevices $found
 }
 
-$failures = 0
 foreach ($result in $results) {
     $product = $result.Context.Iface.Product
     if ($result.Switched) {
         "  {0}: command sent" -f $product
+    } elseif ($result.OtherChannel) {
+        Write-MxError ("  {0}: still on channel {1}, expected {2}." -f $product, $result.OtherChannel, $Channel)
     } else {
-        Write-MxError ("  {0}: the device did not leave this host. It may be asleep, or the target channel may be unpaired." -f $product)
-        $failures++
+        Write-Verbose ("  {0}: could not confirm the switch to channel {1}." -f $product, $Channel)
     }
 }
 
-if ($failures -eq 0) { exit 0 }
-if ($failures -eq $found.Count) { exit 1 }
-Write-MxError "$failures of $($found.Count) devices failed."
-exit 3
+exit (Get-SwitchExitCode $results -QuietUnconfirmed:$QuietUnconfirmed)
 
 }  # end if (-not $env:MXSWITCH_TEST)

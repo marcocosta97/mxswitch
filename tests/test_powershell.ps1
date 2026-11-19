@@ -278,6 +278,20 @@ Describe 'Discovery through a simulated HID transport' {
     }
 }
 
+Describe 'Switch exit codes' {
+    It 'keeps an inconclusive device silent even when another device switches' {
+        $results = @(
+            [pscustomobject]@{ Switched = $true; OtherChannel = $null }
+            [pscustomobject]@{ Switched = $false; OtherChannel = $null }
+        )
+        Get-SwitchExitCode $results -QuietUnconfirmed | Should -Be 4
+        Get-SwitchExitCode $results | Should -Be 3
+        Get-SwitchExitCode @($results[0]) -QuietUnconfirmed | Should -Be 0
+        $results[1].OtherChannel = 1
+        Get-SwitchExitCode $results -QuietUnconfirmed | Should -Be 3
+    }
+}
+
 Describe 'Status and switch protocol' {
     BeforeEach {
         $iface=New-TestInterface mouse @{255=@{Name='Mouse';Unit=1}}
@@ -326,6 +340,20 @@ Describe 'Status and switch protocol' {
         ($calls -join ',') | Should -Be '1:0,2:0,1:1,2:1,1:0,2:0,2:1,2:0'
         Should -Invoke Start-Sleep -Times 2 -Exactly -ParameterFilter { $Milliseconds -eq 250 }
     }
+    It 'verifies a delayed disconnect even when the retry write is rejected' {
+        $script:delayedSwitch = $dev.Slots[255]
+        $script:delayedSwitch.IgnoreSwitches = 1
+        Mock Start-Sleep { }
+        Mock Start-Sleep {
+            $script:delayedSwitch.RejectSwitches = 1
+            $script:delayedSwitch.RejectVerification = $true
+        } -ParameterFilter { $Milliseconds -eq 200 }
+        Mock Get-MxInterfaces { @() }
+
+        (Invoke-Switch $ctx 2 -Attempts 2).Switched | Should -Be $true
+        Should -Invoke Get-MxInterfaces -Times 1 -Exactly
+        Should -Invoke Start-Sleep -Times 1 -Exactly -ParameterFilter { $Milliseconds -eq 250 }
+    }
     It 'reports a rejected write without discarding the other device result' {
         Mock Start-Sleep { }
         $dev.Slots[255].RejectSwitches = 1
@@ -336,13 +364,19 @@ Describe 'Status and switch protocol' {
         $results = @(Invoke-Switch @($ctx, $other) 2 -Attempts 1)
         $results[0].Switched | Should -Be $false
         $results[1].Switched | Should -Be $true
-        $dev.Writes.Count | Should -Be 2
+        $results[0].OtherChannel | Should -Be 1
+        Get-SwitchExitCode $results -QuietUnconfirmed | Should -Be 3
+        $dev.Writes.Count | Should -Be 3
     }
     It 'does not turn a HID++ error into a successful switch' {
         Mock Start-Sleep { }
         $dev.Slots[255].IgnoreSwitches = 4
         $dev.Slots[255].VerifyError = 8
-        (Invoke-Switch $ctx 2).Switched | Should -Be $false
+        $result = Invoke-Switch $ctx 2
+        $result.Switched | Should -Be $false
+        $result.OtherChannel | Should -BeNullOrEmpty
+        Get-SwitchExitCode @($result) -QuietUnconfirmed | Should -Be 4
+        Get-SwitchExitCode @($result) | Should -Be 1
     }
     It 'accepts the receiver reporting a disconnected paired slot' {
         Mock Start-Sleep { }

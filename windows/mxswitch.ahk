@@ -39,10 +39,13 @@ IsPowerShell() {
 RunMx(argName, value := "", allDevices := false, wait := false) {
     global SCRIPT
     CheckScriptPath()
-    if (IsPowerShell()) {
+    usePowerShell := IsPowerShell()
+    if usePowerShell {
         args := value = "" ? "-" argName : "-" argName " " value
         if allDevices
             args .= " -All"
+        if wait
+            args .= " -QuietUnconfirmed"
         command := Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" {2}',
             SCRIPT, args)
     } else {
@@ -62,7 +65,7 @@ RunMx(argName, value := "", allDevices := false, wait := false) {
     }
     if wait {
         exitCode := RunWait(command, , "Hide")
-        if exitCode != 0
+        if (exitCode != 0 && !(usePowerShell && exitCode = 4))
             MsgBox(Format("mxswitch exited with code {1}. Run this command in a terminal:`n`n{2}",
                 exitCode, command), "mxswitch")
         return exitCode = 0
