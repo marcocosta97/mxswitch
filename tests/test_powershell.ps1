@@ -54,7 +54,20 @@ BeforeAll {
                 $r[4]=if ($Frame[2] -eq 6 -and $function -eq 0) {2} else {88}
                 $r[5]=80; $r[6]=if ($profile.ContainsKey('Charge')) {$profile.Charge} else {1}
             } elseif ($Frame[2] -eq 10) {
-                if ($function -eq 1) { $profile.Channel=[int]$Frame[4] }
+                if ($function -eq 1) {
+                    $profile.SwitchAttempted = $true
+                    if ($profile.RejectSwitches) { $profile.RejectSwitches--; return $false }
+                    if ($profile.IgnoreSwitches) { $profile.IgnoreSwitches-- }
+                    else { $profile.Channel=[int]$Frame[4] }
+                } elseif ($profile.SwitchAttempted -and $profile.VerifyError) {
+                    $r[0]=16
+                    $r[2]=if ($profile.ReceiverError) { 0x8f } else { 0xff }
+                    $r[3]=$Frame[2]; $r[4]=$Frame[3]; $r[5]=$profile.VerifyError
+                    $this.Pending=$r
+                    return $true
+                } elseif ($profile.SwitchAttempted -and $profile.RejectVerification) {
+                    return $false
+                }
                 $r[4]=3; $r[5]=if ($profile.ContainsKey('Channel')) {$profile.Channel} else {0}
             }
             $this.Pending=$r
@@ -163,6 +176,13 @@ Describe 'Get-MxConfig' {
             Remove-Item $path -ErrorAction SilentlyContinue
         }
     }
+    It 'reads brackets in a config filename literally' {
+        $path = Join-Path $TestDrive 'config[office]'
+        Set-Content -LiteralPath $path 'channel_a=2','channel_b=3'
+        $cfg = Get-MxConfig -Path $path
+        $cfg.channel_a | Should -Be 2
+        $cfg.channel_b | Should -Be 3
+    }
     It 'rejects a duplicate channel pair' {
         $cfg = [pscustomobject]@{ channel_a = 1; channel_b = 1; device = 'primary' }
         (Test-MxConfig $cfg) | Should -Contain 'channel_a and channel_b must differ'
@@ -174,10 +194,31 @@ Describe 'Get-MxConfig' {
 }
 
 
+Describe 'Cache opens only enumerated Logitech interfaces' {
+    BeforeEach {
+        $CacheFile = Join-Path $TestDrive 'device.json'
+        $iface = New-TestInterface receiver @{2=@{Name='MX Master 3S';Unit=2}}
+        Mock Open-MxDevice { param($Iface) New-TestTransport $Iface }
+    }
+    It 'ignores an unlisted path before opening or writing' {
+        '{"Path":"ordinary-file","ReportId":17,"DevIdx":2,"FeatureIdx":10}' | Set-Content $CacheFile
+        Get-CachedDevice @($iface) | Should -BeNullOrEmpty
+        Should -Invoke Open-MxDevice -Times 0 -Exactly
+    }
+    It 'uses the live report lengths and accepts the previous JSON array format' {
+        '[{"Path":"receiver","ReportId":17,"DevIdx":2,"FeatureIdx":10,"OutLen":1,"InLen":1}]' | Set-Content $CacheFile
+        $found = Get-CachedDevice @($iface)
+        $found.Iface.Product | Should -Be 'MX Master 3S'
+        $found.Iface.OutLen | Should -Be 20
+        $found.Iface.InLen | Should -Be 20
+        Close-MxDevices @($found)
+    }
+}
+
 Describe 'Discovery through a simulated HID transport' {
     BeforeEach {
-        Mock Get-CachedDevices { @() }
-        Mock Save-CachedDevices { }
+        Mock Get-CachedDevice { @() }
+        Mock Save-CachedDevice { }
         $script:opened = New-Object 'System.Collections.Generic.List[object]'
         Mock Open-MxDevice { param($Iface) $dev=New-TestTransport $Iface; $script:opened.Add($dev); return $dev }
     }
@@ -197,6 +238,22 @@ Describe 'Discovery through a simulated HID transport' {
         $found.Count | Should -Be 1
         $found[0].Iface.Product | Should -Be 'Logitech MX Keys S Keyboard'
         Close-MxDevices $found
+    }
+    It 'does not use the cache for all devices or a name filter' {
+        $script:interfaces = @(New-TestInterface receiver @{2=@{Name='MX Master 3S';Unit=2}})
+        Mock Get-MxInterfaces { $script:interfaces }
+        Close-MxDevices @(Find-MxDevices -All)
+        Close-MxDevices @(Find-MxDevices -Names Master)
+        Should -Invoke Get-CachedDevice -Times 0 -Exactly
+        Should -Invoke Save-CachedDevice -Times 0 -Exactly
+    }
+    It 'displays unnamed slots but excludes them from name filters' {
+        $script:interfaces = @(New-TestInterface receiver @{2=@{Name='';Unit=2}})
+        Mock Get-MxInterfaces { $script:interfaces }
+        $found = @(Find-MxDevices -All)
+        $found[0].Iface.Product | Should -Be 'receiver (slot 2)'
+        Close-MxDevices $found
+        @(Find-MxDevices -All -Names Receiver).Count | Should -Be 0
     }
     It 'deduplicates collections without dropping another mouse of the same model' {
         $script:interfaces = @(
@@ -243,12 +300,68 @@ Describe 'Status and switch protocol' {
     }
     It 'accepts a channel that is already active without sending switch commands' {
         $dev.Slots[255].Channel=1
-        Invoke-Switch $ctx 2 | Should -Be $true
+        (Invoke-Switch $ctx 2).Switched | Should -Be $true
         @($dev.Writes | Where-Object { ($_[3] -shr 4) -eq 1 }).Count | Should -Be 0
     }
     It 'accepts a device that still responds on the requested channel' {
-        Invoke-Switch $ctx 2 | Should -Be $true
+        (Invoke-Switch $ctx 2).Switched | Should -Be $true
         $dev.Slots[255].Channel | Should -Be 1
+    }
+    It 'writes to both receiver slots before verification and only retries the old channel' {
+        Mock Start-Sleep { }
+        $iface = New-TestInterface receiver @{
+            1=@{Name='Mouse';Unit=1}
+            2=@{Name='Keyboard';Unit=2;IgnoreSwitches=1}
+        }
+        $dev = New-TestTransport $iface
+        $contexts = @(foreach ($slot in 1,2) {
+            [pscustomobject]@{ Dev=$dev; Iface=$iface; DevIdx=$slot; ReportId=17; FeatureIdx=10 }
+        })
+
+        $results = @(Invoke-Switch $contexts 2)
+        $results.Count | Should -Be 2
+        $results[0].Switched | Should -Be $true
+        $results[1].Switched | Should -Be $true
+        $calls = $dev.Writes | ForEach-Object { '{0}:{1}' -f $_[1], ($_[3] -shr 4) }
+        ($calls -join ',') | Should -Be '1:0,2:0,1:1,2:1,1:0,2:0,2:1,2:0'
+        Should -Invoke Start-Sleep -Times 2 -Exactly -ParameterFilter { $Milliseconds -eq 250 }
+    }
+    It 'reports a rejected write without discarding the other device result' {
+        Mock Start-Sleep { }
+        $dev.Slots[255].RejectSwitches = 1
+        $otherIface = New-TestInterface keyboard @{255=@{Name='Keyboard';Unit=2}}
+        $otherDev = New-TestTransport $otherIface
+        $other = [pscustomobject]@{ Dev=$otherDev; Iface=$otherIface; DevIdx=255; ReportId=17; FeatureIdx=10 }
+
+        $results = @(Invoke-Switch @($ctx, $other) 2 -Attempts 1)
+        $results[0].Switched | Should -Be $false
+        $results[1].Switched | Should -Be $true
+        $dev.Writes.Count | Should -Be 2
+    }
+    It 'does not turn a HID++ error into a successful switch' {
+        Mock Start-Sleep { }
+        $dev.Slots[255].IgnoreSwitches = 4
+        $dev.Slots[255].VerifyError = 8
+        (Invoke-Switch $ctx 2).Switched | Should -Be $false
+    }
+    It 'accepts the receiver reporting a disconnected paired slot' {
+        Mock Start-Sleep { }
+        $iface = New-TestInterface receiver @{1=@{Name='Keyboard';Unit=1;VerifyError=9;ReceiverError=$true}}
+        $dev = New-TestTransport $iface
+        $ctx = [pscustomobject]@{ Dev=$dev; Iface=$iface; DevIdx=1; ReportId=17; FeatureIdx=10 }
+        (Invoke-Switch $ctx 2 -Attempts 1).Switched | Should -Be $true
+    }
+    It 'checks direct device presence when a verification write is rejected' {
+        Mock Start-Sleep { }
+        $dev.Slots[255].RejectVerification = $true
+        $script:verificationIfaces = @($iface)
+        Mock Get-MxInterfaces { $script:verificationIfaces }
+        (Invoke-Switch $ctx 2 -Attempts 1).Switched | Should -Be $false
+
+        $dev.Slots[255].SwitchAttempted = $false
+        $dev.Slots[255].Channel = 0
+        $script:verificationIfaces = @()
+        (Invoke-Switch $ctx 2 -Attempts 1).Switched | Should -Be $true
     }
     It 'rotates request IDs' {
         Resolve-MxFeature $dev 17 255 0x1814 | Should -Be 10

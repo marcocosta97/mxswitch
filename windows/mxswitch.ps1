@@ -117,8 +117,8 @@ function Get-MxConfig {
     param([string]$Path = $ConfigFile)
 
     $cfg = [ordered]@{ channel_a = 1; channel_b = 2; device = 'primary'; name = '' }
-    if ($Path -and (Test-Path $Path)) {
-        foreach ($line in Get-Content $Path) {
+    if ($Path -and (Test-Path -LiteralPath $Path)) {
+        foreach ($line in Get-Content -LiteralPath $Path) {
             $clean = ($line -split '#', 2)[0].Trim()
             if (-not $clean) { continue }
             $parts = $clean -split '=', 2
@@ -374,21 +374,36 @@ public class Hid {
 
 function Invoke-HidppCall {
     param($Dev, [int]$ReportId, [int]$DevIdx, [int]$FeatureIdx, [int]$Function,
-          [byte[]]$Params = @(), [int]$TimeoutMs = 400)
+          [byte[]]$Params = @(), [int]$TimeoutMs = 400, [ref]$Outcome)
 
+    if ($Outcome) { $Outcome.Value = 'timeout' }
     $frame = New-HidppFrame $ReportId $DevIdx $FeatureIdx $Function $Params
     $swId = if ($Dev.PSObject.Properties.Name -contains 'NextSwId') { $Dev.NextSwId } else { $SW_ID }
     $next = 8 + (($swId - 8 + 1) % 8)
     $Dev | Add-Member -NotePropertyName NextSwId -NotePropertyValue $next -Force
     $frame[3] = ($Function -shl 4) -bor $swId
-    if (-not $Dev.Write($frame)) { return $null }   # collection rejected it
+    if (-not $Dev.Write($frame)) {
+        if ($Outcome) { $Outcome.Value = 'write-failed' }
+        return $null
+    }
 
     $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
     while ((Get-Date) -lt $deadline) {
         $r = $Dev.Read(100)
         $verdict = Get-ReplyVerdict -Reply $r -DevIdx $DevIdx -FeatureIdx $FeatureIdx -Function $Function -SwId $swId
-        if ($verdict -eq 'match') { return $r }
-        if ($verdict -eq 'error') { return $null }
+        if ($verdict -eq 'match') {
+            if ($Outcome) { $Outcome.Value = 'reply' }
+            return $r
+        }
+        if ($verdict -eq 'error') {
+            if ($Outcome) {
+                # Unifying's HID++ 1.0 resource error means the paired slot is disconnected.
+                $Outcome.Value = if ($DevIdx -ne 255 -and $r[2] -eq 0x8f -and $r[5] -eq 9) {
+                    'disconnected'
+                } else { 'error' }
+            }
+            return $null
+        }
     }
     return $null
 }
@@ -433,70 +448,57 @@ function Resolve-MxProduct {
     return ''
 }
 
-<#
-    Discovery costs a round trip per candidate collection and device index, so
-    the resolved answer is cached. This is purely a latency win: a cached path
-    for a device that has since gone to sleep will not open, and we fall back to
-    a full scan. The cache is validated on every use rather than trusted, so a
-    firmware update that moves the feature index self-corrects.
-#>
-function Get-CachedDevices {
-    if ($NoCache -or -not (Test-Path $CacheFile)) { return @() }
-    try { $entries = Get-Content $CacheFile -Raw | ConvertFrom-Json } catch { return @() }
-    if ($null -eq $entries) { return @() }
-    if ($entries -isnot [System.Collections.IEnumerable] -or
-        $entries -is [string]) {
-        $entries = @($entries)
-    }
+# Only live Logitech interfaces supply paths and report sizes to the HID writer.
+function Get-CachedDevice {
+    param($Interfaces)
 
-    $valid = @()
-    foreach ($c in $entries) {
-        $iface = New-Object 'Hid+Iface'
-        $iface.Path = $c.Path; $iface.Product = $c.Product
-        $iface.UsagePage = $c.UsagePage; $iface.Usage = $c.Usage; $iface.Pid = $c.Pid
-        $iface.InLen = $c.InLen; $iface.OutLen = $c.OutLen
+    if (-not (Test-Path -LiteralPath $CacheFile -PathType Leaf)) { return }
+    try {
+        $entry = @(Get-Content -LiteralPath $CacheFile -Raw | ConvertFrom-Json)[0]
+        $rid = [int]$entry.ReportId
+        $slot = [int]$entry.DevIdx
+        $feature = [int]$entry.FeatureIdx
+    } catch { return }
 
-        try { $dev = New-Object Hid $iface } catch {
-            foreach ($v in $valid) { $v.Dev.Close() }
-            return @()
-        }
+    $iface = $Interfaces | Where-Object Path -EQ $entry.Path | Select-Object -First 1
+    if (-not $iface -or $slot -notin $DEVICE_INDICES -or $feature -lt 1 -or $feature -gt 255 -or
+        -not $FRAME_LEN[$rid] -or $FRAME_LEN[$rid] -gt $iface.OutLen) { return }
 
-        # Confirm the cached feature index still resolves to ChangeHost. Only
-        # accept the report ID that actually produced the reply.
-        $rid = $c.ReportId
-        $r = Invoke-HidppCall $dev $rid $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
+    try { $dev = Open-MxDevice $iface } catch { return }
+    $keep = $false
+    try {
+        $probe = [byte[]]@(0x18, 0x14, 0)
+        $r = Invoke-HidppCall $dev $rid $slot 0 0 $probe 250
         if (-not $r) {
             $alt = if ($rid -eq 0x11) { 0x10 } else { 0x11 }
-            $r = Invoke-HidppCall $dev $alt $c.DevIdx 0 0 ([byte[]]@(0x18, 0x14, 0x00)) 250
-            if ($r) { $rid = $alt }
-        }
-        if ($r -and $r[4] -eq $c.FeatureIdx -and $r[4] -ne 0) {
-            $valid += [pscustomobject]@{ Dev = $dev; ReportId = $rid; DevIdx = $c.DevIdx
-                                         FeatureIdx = $c.FeatureIdx; Iface = $iface }
-        } else {
-            $dev.Close()
-            foreach ($v in $valid) { $v.Dev.Close() }
-            return @()          # one stale entry invalidates the cache
-        }
-    }
-    return $valid
-}
-
-function Save-CachedDevices {
-    param($Contexts)
-    if ($NoCache) { return }
-    try {
-        $dir = Split-Path $CacheFile -Parent
-        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        $entries = $Contexts | ForEach-Object {
-            [pscustomobject]@{
-                Path = $_.Iface.Path; Product = $_.Iface.Product
-                UsagePage = $_.Iface.UsagePage; Usage = $_.Iface.Usage
-                Pid = $_.Iface.Pid; InLen = $_.Iface.InLen; OutLen = $_.Iface.OutLen
-                DevIdx = $_.DevIdx; ReportId = $_.ReportId; FeatureIdx = $_.FeatureIdx
+            if ($FRAME_LEN[$alt] -le $iface.OutLen) {
+                $r = Invoke-HidppCall $dev $alt $slot 0 0 $probe 250
+                if ($r) { $rid = $alt }
             }
         }
-        ConvertTo-Json -InputObject @($entries) | Set-Content $CacheFile
+        if (-not $r -or $r[4] -ne $feature) { return }
+        $metadata = Get-MxMetadata $dev $iface $rid $slot
+        if ((Get-DeviceRank $iface.UsagePage $iface.Usage $metadata.Product) -ge 10) { return }
+
+        $iface.Product = $metadata.Product
+        $keep = $true
+        [pscustomobject]@{ Dev=$dev; ReportId=$rid; DevIdx=$slot; FeatureIdx=$feature; Iface=$iface }
+    } finally {
+        if (-not $keep) { $dev.Close() }
+    }
+}
+
+function Save-CachedDevice {
+    param($Context)
+
+    try {
+        $dir = Split-Path $CacheFile -Parent
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $entry = [pscustomobject]@{
+            Path=$Context.Iface.Path; DevIdx=$Context.DevIdx
+            ReportId=$Context.ReportId; FeatureIdx=$Context.FeatureIdx
+        }
+        ConvertTo-Json -InputObject $entry | Set-Content -LiteralPath $CacheFile
     } catch { Write-Verbose 'could not write cache' }
 }
 
@@ -504,10 +506,9 @@ function Get-MxInterfaces { [Hid]::Enumerate($VID) }
 function Open-MxDevice { param($Iface) New-Object Hid $Iface }
 
 function Close-MxDevices {
-    param($Contexts, $Keep = $null)
+    param($Contexts)
     $closed = New-Object 'System.Collections.Generic.List[object]'
     foreach ($c in $Contexts) {
-        if ([object]::ReferenceEquals($c.Dev, $Keep)) { continue }
         $shared = $false
         foreach ($dev in $closed) {
             if ([object]::ReferenceEquals($dev, $c.Dev)) { $shared = $true; break }
@@ -519,9 +520,11 @@ function Close-MxDevices {
 function Get-MxMetadata {
     param($Dev, $Iface, [int]$ReportId, [int]$DevIdx)
     $product = Resolve-MxProduct $Iface.Product $Iface.Pid
+    $hasName = $true
     $identity = ($Iface.Path.ToLowerInvariant() -replace '&col[0-9a-f]{2}', '') + ":$DevIdx"
     if ($DevIdx -ne 255) {
         $product = "receiver (slot $DevIdx)"
+        $hasName = $false
         $idx = Resolve-MxFeature $Dev $ReportId $DevIdx 0x0005
         if ($idx) {
             $r = Invoke-HidppCall $Dev $ReportId $DevIdx $idx 0
@@ -534,7 +537,10 @@ function Get-MxMetadata {
                     $n = [Math]::Min($fragment.Length - 4, $length - $bytes.Count)
                     for ($i = 0; $i -lt $n; $i++) { $bytes.Add($fragment[4+$i]) }
                 }
-                if ($bytes.Count -eq $length) { $product = [Text.Encoding]::UTF8.GetString($bytes.ToArray()) }
+                if ($bytes.Count -eq $length) {
+                    $product = [Text.Encoding]::UTF8.GetString($bytes.ToArray())
+                    $hasName = [bool]$product
+                }
             }
         }
     }
@@ -545,26 +551,21 @@ function Get-MxMetadata {
             $identity = 'unit:' + (Format-MxHex ([byte[]]$r[5..8]))
         }
     }
-    [pscustomobject]@{ Product = $product; Identity = $identity }
+    [pscustomobject]@{ Product = $product; HasName = $hasName; Identity = $identity }
 }
 
 # Every slot is discovered before filtering and ranking the peripherals.
 function Find-MxDevices {
     param([switch]$All, [string[]]$Names)
-    $cached = @(Get-CachedDevices)
-    if ($cached.Count -gt 0 -and -not $All -and -not $Names) {
-        $first = $cached[0]
-        $metadata = Get-MxMetadata $first.Dev $first.Iface $first.ReportId $first.DevIdx
-        $first.Iface.Product = $metadata.Product
-        if ((Get-DeviceRank $first.Iface.UsagePage $first.Iface.Usage $metadata.Product) -lt 10) {
-            Close-MxDevices $cached -Keep $first.Dev
-            return @($first)
-        }
+    $ifaces = @(Get-MxInterfaces)
+    $useCache = -not $NoCache -and -not $All -and -not $Names
+    if ($useCache) {
+        $cached = Get-CachedDevice $ifaces
+        if ($cached) { return $cached }
     }
-    Close-MxDevices $cached
     $contexts = @(); $opened = @(); $seen = @{}
     try {
-        $ifaces = @(Get-MxInterfaces | Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product })
+        $ifaces = @($ifaces | Sort-Object { Get-DeviceRank $_.UsagePage $_.Usage $_.Product })
         foreach ($iface in $ifaces) {
             $preferred = $false
             try { $dev = Open-MxDevice $iface } catch { continue }
@@ -580,7 +581,8 @@ function Find-MxDevices {
                 }
                 if (-not $matched) { continue }
                 $metadata = Get-MxMetadata $dev $iface $rid $didx
-                if (-not $seen.ContainsKey($metadata.Identity) -and (Test-MxName $metadata.Product $Names)) {
+                if (-not $seen.ContainsKey($metadata.Identity) -and
+                    (-not $Names -or ($metadata.HasName -and (Test-MxName $metadata.Product $Names)))) {
                     $seen[$metadata.Identity] = $true
                     # Each peripheral needs its own product name, even on a shared handle.
                     $deviceIface = [pscustomobject]@{ Path = $iface.Path; Product = $metadata.Product
@@ -607,7 +609,7 @@ function Find-MxDevices {
             if (-not $retained) { $o.Dev.Close() }
         }
         $opened = @()
-        if ($contexts.Count) { Save-CachedDevices $contexts }
+        if ($useCache -and $contexts.Count) { Save-CachedDevice $contexts[0] }
         return $contexts
     } catch { Close-MxDevices $opened; throw }
 }
@@ -681,23 +683,52 @@ function Show-MxHuman {
 # ---------------------------------------------------------------------------
 
 function Invoke-Switch {
-    param($Ctx, [int]$TargetChannel, [int]$Attempts = 4)
+    param([object[]]$Contexts, [int]$TargetChannel, [int]$Attempts = 4)
 
-    $current = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 0
-    if ($current -and $current.Length -ge 6 -and ($current[5] + 1) -eq $TargetChannel) { return $true }
-    $frame = New-HidppFrame $Ctx.ReportId $Ctx.DevIdx $Ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        Write-Verbose "switch attempt $attempt"
-        if ($Ctx.Dev.Write($frame)) {
-            Start-Sleep -Milliseconds 250
-            $still = Invoke-HidppCall $Ctx.Dev $Ctx.ReportId $Ctx.DevIdx `
-                                      $Ctx.FeatureIdx 0 @() 250
-            if (-not $still -or ($still.Length -ge 6 -and ($still[5] + 1) -eq $TargetChannel)) { return $true }        # gone: it worked
-            Write-Verbose 'device still responding, retrying'
+    $results = @(foreach ($ctx in $Contexts) {
+        $current = Invoke-HidppCall $ctx.Dev $ctx.ReportId $ctx.DevIdx $ctx.FeatureIdx 0
+        [pscustomobject]@{
+            Context = $ctx
+            Frame = New-HidppFrame $ctx.ReportId $ctx.DevIdx $ctx.FeatureIdx 1 ([byte[]]@($TargetChannel - 1))
+            Switched = $current -and $current.Length -ge 6 -and ($current[5] + 1) -eq $TargetChannel
+            Written = $false
         }
-        Start-Sleep -Milliseconds 200
+    })
+    $pending = @($results | Where-Object { -not $_.Switched })
+    for ($attempt = 1; $attempt -le $Attempts -and $pending.Count -gt 0; $attempt++) {
+        Write-Verbose "switch attempt $attempt on $($pending.Count) device(s)"
+        $wroteAny = $false
+        foreach ($result in $pending) {
+            $result.Written = $result.Context.Dev.Write($result.Frame)
+            $wroteAny = $wroteAny -or $result.Written
+        }
+        # Give every write time to land before checking any device.
+        if ($wroteAny) { Start-Sleep -Milliseconds 250 }
+
+        $presentPaths = $null
+        $pending = @(foreach ($result in $pending) {
+            if ($result.Written) {
+                $ctx = $result.Context
+                $outcome = ''
+                $still = Invoke-HidppCall $ctx.Dev $ctx.ReportId $ctx.DevIdx $ctx.FeatureIdx 0 @() 250 ([ref]$outcome)
+                if ($outcome -eq 'write-failed' -and $ctx.DevIdx -eq 255) {
+                    if ($null -eq $presentPaths) { $presentPaths = @(Get-MxInterfaces | ForEach-Object Path) }
+                    if ($ctx.Iface.Path -notin $presentPaths) { $outcome = 'disconnected' }
+                }
+                if ($outcome -in @('timeout', 'disconnected') -or
+                    ($still -and $still.Length -ge 6 -and ($still[5] + 1) -eq $TargetChannel)) {
+                    $result.Switched = $true
+                    continue
+                }
+                Write-Verbose "could not verify the switch ($outcome)"
+            }
+            $result
+        })
+        if ($attempt -lt $Attempts -and $pending.Count -gt 0) {
+            Start-Sleep -Milliseconds 200
+        }
     }
-    return $false
+    $results
 }
 
 
@@ -833,16 +864,22 @@ if ($DryRun) {
 #>
 
 "Switching to channel $Channel ..."
+try {
+    $results = @(Invoke-Switch $found $Channel)
+} finally {
+    Close-MxDevices $found
+}
+
 $failures = 0
-foreach ($c in $found) {
-    if (Invoke-Switch $c $Channel) {
-        "  {0}: command sent" -f $c.Iface.Product
+foreach ($result in $results) {
+    $product = $result.Context.Iface.Product
+    if ($result.Switched) {
+        "  {0}: command sent" -f $product
     } else {
-        Write-MxError ("  {0}: the device did not leave this host. It may be asleep, or the target channel may be unpaired." -f $c.Iface.Product)
+        Write-MxError ("  {0}: the device did not leave this host. It may be asleep, or the target channel may be unpaired." -f $product)
         $failures++
     }
 }
-Close-MxDevices $found
 
 if ($failures -eq 0) { exit 0 }
 if ($failures -eq $found.Count) { exit 1 }
