@@ -363,6 +363,42 @@ Describe 'Status and switch protocol' {
         $script:verificationIfaces = @()
         (Invoke-Switch $ctx 2 -Attempts 1).Switched | Should -Be $true
     }
+    It 'stops after one read on timeout or transport failure (<expected>)' -TestCases @(
+        @{ Reply = [byte[]]@(); Expected = 'timeout' }
+        @{ Reply = $null; Expected = 'read-failed' }
+    ) {
+        param($Reply, $Expected)
+        $dev = [pscustomobject]@{ Reply=$Reply; Reads=0 }
+        $dev | Add-Member ScriptMethod Write { param($Frame) return $true }
+        $dev | Add-Member ScriptMethod Read {
+            param($TimeoutMs)
+            $this.Reads++
+            if ($null -eq $this.Reply) { return $null }
+            return ,$this.Reply
+        }
+        $outcome = ''
+        Invoke-HidppCall $dev 17 255 10 0 @() 250 ([ref]$outcome) | Should -BeNullOrEmpty
+        $outcome | Should -Be $Expected
+        $dev.Reads | Should -Be 1
+    }
+    It 'uses the remaining budget after an unrelated report' {
+        $dev = [pscustomobject]@{ Budgets=(New-Object 'System.Collections.Generic.List[int]') }
+        $dev | Add-Member ScriptMethod Write { param($Frame) return $true }
+        $dev | Add-Member ScriptMethod Read {
+            param([int]$TimeoutMs)
+            $this.Budgets.Add($TimeoutMs)
+            if ($this.Budgets.Count -eq 1) {
+                Start-Sleep -Milliseconds 15
+                return ,([byte[]]@(0x11,0xff,0x0a,0x00) + (New-Object byte[] 16))
+            }
+            return ,([byte[]]@())
+        }
+        Invoke-HidppCall $dev 17 255 10 0 @() 250 | Should -BeNullOrEmpty
+        $dev.Budgets.Count | Should -Be 2
+        $dev.Budgets[0] | Should -BeLessOrEqual 250
+        $dev.Budgets[0] | Should -BeGreaterThan 100
+        $dev.Budgets[1] | Should -BeLessThan $dev.Budgets[0]
+    }
     It 'rotates request IDs' {
         Resolve-MxFeature $dev 17 255 0x1814 | Should -Be 10
         Resolve-MxFeature $dev 17 255 5 | Should -Be 5

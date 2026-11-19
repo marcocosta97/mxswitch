@@ -335,7 +335,7 @@ public class Hid {
      * normal, expected outcome of probing, not an error worth aborting on.
      */
     public bool Write(byte[] frame) {
-        if (outLen <= 0) return false;
+        if (outLen <= 0 || !stream.CanWrite) return false;
         var buf = new byte[outLen];
         Array.Copy(frame, buf, Math.Min(frame.Length, outLen));
         try {
@@ -346,25 +346,26 @@ public class Hid {
           catch (UnauthorizedAccessException) { return false; }
     }
 
-    // A synchronous read on a device with nothing to say never returns, so this
-    // races the read against a timer and cancels it on timeout. The aborted read
-    // must be drained before returning: FileStream serialises async operations,
-    // so a still-pending read would block every later ReadAsync until it lands.
+    static readonly byte[] ReadTimeout = new byte[0];
+
+    // An empty report means timeout. Null means the transport failed.
     public byte[] Read(int timeoutMs) {
-        if (inLen <= 0) return new byte[0];
+        if (inLen <= 0 || !stream.CanRead) return null;
         var buf = new byte[inLen];
         try {
             var task = stream.ReadAsync(buf, 0, inLen);
             if (Task.WaitAny(new Task[] { task }, timeoutMs) != 0) {
-                CancelIoEx(handle, IntPtr.Zero);
-                try { task.Wait(1000); } catch (Exception) { }
-                return new byte[0];
+                bool cancelled = CancelIoEx(handle, IntPtr.Zero);
+                // Drain the cancelled read before using this handle again.
+                try { task.Wait(1000); } catch (AggregateException) { }
+                if (!task.IsCompleted) { Close(); return null; }
+                if (task.Status != TaskStatus.RanToCompletion) return cancelled ? ReadTimeout : null;
             }
-            if (task.IsFaulted || task.Result <= 0) return new byte[0];
+            if (task.Status != TaskStatus.RanToCompletion || task.Result <= 0) return null;
             var outb = new byte[task.Result];
             Array.Copy(buf, outb, task.Result);
             return outb;
-        } catch (Exception) { return new byte[0]; }
+        } catch (Exception) { return null; }
     }
 
     public void Close() { try { stream.Dispose(); } catch {} }
@@ -387,9 +388,14 @@ function Invoke-HidppCall {
         return $null
     }
 
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
-    while ((Get-Date) -lt $deadline) {
-        $r = $Dev.Read(100)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    while (($remaining = $TimeoutMs - [int]$clock.ElapsedMilliseconds) -gt 0) {
+        $r = $Dev.Read($remaining)
+        if ($null -eq $r) {
+            if ($Outcome) { $Outcome.Value = 'read-failed' }
+            return $null
+        }
+        if ($r.Length -eq 0) { break }
         $verdict = Get-ReplyVerdict -Reply $r -DevIdx $DevIdx -FeatureIdx $FeatureIdx -Function $Function -SwId $swId
         if ($verdict -eq 'match') {
             if ($Outcome) { $Outcome.Value = 'reply' }
@@ -711,7 +717,7 @@ function Invoke-Switch {
                 $ctx = $result.Context
                 $outcome = ''
                 $still = Invoke-HidppCall $ctx.Dev $ctx.ReportId $ctx.DevIdx $ctx.FeatureIdx 0 @() 250 ([ref]$outcome)
-                if ($outcome -eq 'write-failed' -and $ctx.DevIdx -eq 255) {
+                if ($outcome -in @('write-failed', 'read-failed') -and $ctx.DevIdx -eq 255) {
                     if ($null -eq $presentPaths) { $presentPaths = @(Get-MxInterfaces | ForEach-Object Path) }
                     if ($ctx.Iface.Path -notin $presentPaths) { $outcome = 'disconnected' }
                 }
